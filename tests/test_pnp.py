@@ -10,6 +10,9 @@ Test strategy:
     5. Noise sensitivity: small pixel noise → position within tolerance.
     6. Distance-based noise scaling: farther = noisier measurement.
     7. Multiple detections: solve_multiple with gate map.
+    8. State-guided solve: providing drone_state improves accuracy.
+    9. Rejection: high reprojection error, excessive distance, far from ESKF.
+   10. Confidence capping: ≤4 model corners → MEDIUM max confidence.
 """
 
 from __future__ import annotations
@@ -17,10 +20,12 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from drone_racing.perception.pnp import PnPSolver
 from drone_racing.utils.config import load_config
 from drone_racing.utils.transforms import (
+    body_to_camera_rotation,
     quat_identity,
 )
 from drone_racing.utils.types import (
@@ -29,6 +34,7 @@ from drone_racing.utils.types import (
     EstimationConfig,
     GateDetection,
     GateWaypoint,
+    State,
 )
 
 # ---------------------------------------------------------------------------
@@ -326,3 +332,241 @@ class TestSolveMultiple:
         results = solver.solve_multiple([det], [gate], corners_local)
         assert len(results) == 1
         assert results[0].gate_id == 0
+
+
+# ---------------------------------------------------------------------------
+# Transform chain correctness — the exact chain from the PnP solver
+# ---------------------------------------------------------------------------
+
+
+def _make_drone_state(
+    position: np.ndarray,
+    orientation: np.ndarray,
+    velocity: np.ndarray | None = None,
+) -> State:
+    """Create a minimal State for PnP tests."""
+    return State(
+        timestamp_ns=0,
+        position=position.astype(np.float64),
+        velocity=(velocity if velocity is not None else np.zeros(3)).astype(np.float64),
+        orientation=orientation.astype(np.float64),
+        accel_bias=np.zeros(3),
+        gyro_bias=np.zeros(3),
+        covariance=np.eye(15) * 0.01,
+    )
+
+
+def _synth_detection(
+    drone_pos: np.ndarray,
+    drone_ori: np.ndarray,
+    gate: GateWaypoint,
+    corners_local: np.ndarray,
+    camera_config: CameraConfig,
+    tilt_deg: float,
+) -> GateDetection | None:
+    """Synthesise a perfect detection from known drone and gate pose.
+
+    Projects gate corners through the full camera model to produce pixel
+    coordinates that the PnP solver should be able to invert.
+    """
+    r_wb = Rotation.from_quat(drone_ori).as_matrix()
+    r_cb = body_to_camera_rotation(tilt_deg)
+    r_cw = r_cb @ r_wb.T
+    t_cw = -r_cw @ drone_pos
+
+    # Transform corners to camera frame
+    r_wg = Rotation.from_quat(gate.orientation_w).as_matrix()
+    corners_world = (r_wg @ corners_local.T).T + gate.position_w
+    pts_c = (r_cw @ corners_world.T).T + t_cw
+
+    # All points must be in front of camera
+    if np.any(pts_c[:, 2] <= 0.1):
+        return None
+
+    # Project using camera intrinsics
+    k = camera_config.intrinsic_matrix
+    dist = camera_config.distortion_coeffs
+    rvec_cw, _ = cv2.Rodrigues(r_cw)
+    img_pts = _project_points(corners_world, rvec_cw, t_cw, k, dist)
+
+    return GateDetection(
+        timestamp_ns=1000,
+        corners_2d=img_pts,
+        confidence=0.9,
+        gate_id=gate.gate_id,
+    )
+
+
+class TestPnPTransformChain:
+    """Verify the PnP solver recovers drone position via the T_WB chain.
+
+    These tests catch the class of bugs found during integration:
+    - Incorrect T_CB rotation (R_BC vs R_BC^T)
+    - Wrong transform chain order
+    """
+
+    def test_drone_approaching_gate(self, solver: PnPSolver, camera_config: CameraConfig) -> None:
+        """Drone approaching a gate along +X axis → recovers position.
+
+        Gate at [10,0,3] facing -X (normal points toward drone).
+        Drone at [5,0,3] facing +X (toward gate).
+        """
+        gate_pos = np.array([10.0, 0.0, 3.0])
+        # Gate facing -X: rotate gate so its Z-axis points along -X
+        gate_ori = Rotation.from_euler("yz", [np.pi / 2, np.pi]).as_quat()
+        corners_local = _gate_corners_local()
+        r_wg = Rotation.from_quat(gate_ori).as_matrix()
+        corners_w = (r_wg @ corners_local.T).T + gate_pos
+
+        gate = GateWaypoint(
+            gate_id=0,
+            position_w=gate_pos,
+            orientation_w=gate_ori.astype(np.float64),
+            corners_3d_w=corners_w.astype(np.float64),
+        )
+
+        drone_pos = np.array([5.0, 0.0, 3.0])
+        drone_ori = Rotation.from_euler("z", 0.0).as_quat()  # facing +X
+        drone_state = _make_drone_state(drone_pos, drone_ori)
+
+        det = _synth_detection(
+            drone_pos,
+            drone_ori,
+            gate,
+            corners_local,
+            camera_config,
+            camera_config.tilt_deg,
+        )
+        assert det is not None
+
+        meas = solver.solve(det, gate, corners_local, drone_state=drone_state)
+        assert meas is not None
+        pos_err = float(np.linalg.norm(meas.position_w - drone_pos))
+        assert pos_err < 1.0, f"Position error {pos_err:.2f}m too large"
+
+    def test_gate_off_to_the_side(self, solver: PnPSolver, camera_config: CameraConfig) -> None:
+        """Drone and gate at same height, gate off to the side."""
+        gate_pos = np.array([8.0, 5.0, 3.0])
+        gate_ori = Rotation.from_euler("z", -np.pi / 2).as_quat()
+        corners_local = _gate_corners_local()
+        r_wg = Rotation.from_quat(gate_ori).as_matrix()
+        corners_w = (r_wg @ corners_local.T).T + gate_pos
+
+        gate = GateWaypoint(
+            gate_id=1,
+            position_w=gate_pos,
+            orientation_w=gate_ori.astype(np.float64),
+            corners_3d_w=corners_w.astype(np.float64),
+        )
+
+        drone_pos = np.array([8.0, 0.0, 3.0])
+        drone_ori = Rotation.from_euler("z", np.pi / 2).as_quat()  # facing +Y
+        drone_state = _make_drone_state(drone_pos, drone_ori)
+
+        det = _synth_detection(
+            drone_pos,
+            drone_ori,
+            gate,
+            corners_local,
+            camera_config,
+            camera_config.tilt_deg,
+        )
+        assert det is not None
+
+        meas = solver.solve(det, gate, corners_local, drone_state=drone_state)
+        assert meas is not None
+        pos_err = float(np.linalg.norm(meas.position_w - drone_pos))
+        assert pos_err < 1.5, f"Position error {pos_err:.2f}m too large"
+
+
+class TestPnPRejection:
+    """Verify the solver rejects bad solutions."""
+
+    def test_rejects_distant_gate(self, solver: PnPSolver, camera_config: CameraConfig) -> None:
+        """Gate >12m away → None (too far for reliable PnP)."""
+        gate = _gate_at_origin()
+        corners_local = _gate_corners_local()
+
+        # Very far away: 20m
+        rvec = np.zeros(3)
+        tvec = np.array([0.0, 0.0, 20.0])
+        img_pts = _project_points(
+            corners_local,
+            rvec,
+            tvec,
+            camera_config.intrinsic_matrix,
+            camera_config.distortion_coeffs,
+        )
+        det = GateDetection(
+            timestamp_ns=0,
+            corners_2d=img_pts,
+            confidence=0.9,
+            gate_id=0,
+        )
+        meas = solver.solve(det, gate, corners_local)
+        assert meas is None
+
+    def test_rejects_position_far_from_eskf(
+        self, solver: PnPSolver, camera_config: CameraConfig
+    ) -> None:
+        """PnP result >5m from ESKF estimate → rejected."""
+        gate = _gate_at_origin()
+        corners_local = _gate_corners_local()
+
+        # True camera-from-gate: 5m ahead
+        rvec = np.zeros(3)
+        tvec = np.array([0.0, 0.0, 5.0])
+        img_pts = _project_points(
+            corners_local,
+            rvec,
+            tvec,
+            camera_config.intrinsic_matrix,
+            camera_config.distortion_coeffs,
+        )
+        det = GateDetection(
+            timestamp_ns=0,
+            corners_2d=img_pts,
+            confidence=0.9,
+            gate_id=0,
+        )
+
+        # Provide a drone state that's very far from where PnP will compute
+        far_state = _make_drone_state(
+            np.array([100.0, 100.0, 100.0]),
+            Rotation.from_euler("z", 0.0).as_quat(),
+        )
+        meas = solver.solve(det, gate, corners_local, drone_state=far_state)
+        # Should be rejected because PnP position is far from ESKF estimate
+        assert meas is None
+
+
+class TestPnPConfidenceCapping:
+    """4 coplanar corners → confidence capped at MEDIUM."""
+
+    def test_high_confidence_capped_with_4_corners(
+        self, solver: PnPSolver, camera_config: CameraConfig
+    ) -> None:
+        """HIGH confidence detection with only 4 model corners → capped to MEDIUM."""
+        gate = _gate_at_origin()
+        corners_local = _gate_corners_local()  # 4 corners
+        assert len(corners_local) == 4
+
+        rvec = np.zeros(3)
+        tvec = np.array([0.0, 0.0, 4.0])
+        img_pts = _project_points(
+            corners_local,
+            rvec,
+            tvec,
+            camera_config.intrinsic_matrix,
+            camera_config.distortion_coeffs,
+        )
+        det = GateDetection(
+            timestamp_ns=0,
+            corners_2d=img_pts,
+            confidence=0.95,  # HIGH confidence
+            gate_id=0,
+        )
+        meas = solver.solve(det, gate, corners_local)
+        assert meas is not None
+        # Should be capped to MEDIUM, not HIGH
+        assert meas.confidence == DetectionConfidence.MEDIUM

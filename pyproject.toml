@@ -28,6 +28,9 @@ rl = [
     "stable-baselines3>=2.2",
     "gymnasium>=0.29",
 ]
+viz = [
+    "matplotlib>=3.8",
+]
 dev = [
     "pytest>=8.0",
     "pytest-benchmark>=4.0",
@@ -38,7 +41,7 @@ dev = [
     "pre-commit>=3.6",
 ]
 all = [
-    "ai-grand-prix[perception,control,rl,dev]",
+    "ai-grand-prix[perception,control,rl,viz,dev]",
 ]
 
 [build-system]
