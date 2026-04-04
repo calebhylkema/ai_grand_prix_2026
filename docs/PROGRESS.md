@@ -1,8 +1,8 @@
 # AI Grand Prix — Progress Tracker
 
-**Last Updated:** 2026-03-12
+**Last Updated:** 2026-04-04
 **Current Phase:** Phase 0 — Foundation
-**Current Step:** Step 1 — Project Initialization
+**Current Step:** Step 7 — Integration (in progress)
 
 ---
 
@@ -17,13 +17,13 @@
 - [x] Create .gitignore
 - [x] Create CI workflow (.github/workflows/ci.yml)
 - [x] Create docs (RESEARCH.md, PLAN.md, CHATGPT_RESEARCH.md)
-- [ ] Open folder in VS Code ← YOU ARE HERE
-- [ ] Initialize git repo
-- [ ] Install uv (if not already installed)
-- [ ] Run `uv sync --all-extras` to install all dependencies
-- [ ] Verify: `uv run python -c "import numpy; print(numpy.__version__)"`
-- [ ] Initial git commit
-- [ ] Create GitHub repo and push
+- [x] Open folder in VS Code
+- [x] Initialize git repo
+- [x] Install uv
+- [x] Run `uv sync` to install dependencies
+- [x] Verify imports working
+- [x] Initial git commit
+- [x] Create GitHub repo and push (calebhylkema/ai_grand_prix_2026)
 
 ### Step 2: Core Data Types & Interfaces
 - [ ] `drone_racing/utils/types.py` — DroneState, DroneCommand, GateDetection, TelemetryData dataclasses
@@ -65,12 +65,15 @@
 - [ ] Latency benchmark: control loop <1ms
 
 ### Step 7: Integration — Full Pipeline with Mock Sim
-- [ ] `drone_racing/sim/mock_adapter.py` — replays image sequences + simulated IMU + basic physics
-- [ ] `scripts/run_sim.py` — entry point that wires everything together
-- [ ] Full pipeline: mock camera → detect → PnP → ESKF → plan → PID → command
-- [ ] Drone completes a simple 4-gate circuit in mock sim without crashing
-- [ ] End-to-end latency profiling: <40ms target
-- [ ] Flight data logger working, can replay runs
+- [x] `drone_racing/sim/mock_adapter.py` — 6-DOF physics + synthetic camera + IMU
+- [x] `drone_racing/logging/flight_logger.py` — telemetry recording to .npz
+- [x] `scripts/run_sim.py` — entry point that wires everything together
+- [x] Full pipeline: mock camera → detect → PnP → ESKF → plan → PID → command
+- [x] Drone completes a 4-gate circuit (1 lap with IMU-only ESKF) ← YOU ARE HERE
+- [x] End-to-end latency profiling: 2.8ms avg, 3.8ms p95 (well under 40ms)
+- [x] Flight data logger working, saves .npz files
+- [ ] PnP vision corrections producing accurate poses on synthetic images
+- [ ] Multiple laps with ESKF vision corrections enabled
 
 ### Step 8: MPCC Planner (Performance Upgrade)
 - [ ] `drone_racing/planning/mpcc.py` — CasADi-based MPCC solver

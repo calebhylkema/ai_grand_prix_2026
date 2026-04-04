@@ -305,8 +305,8 @@ class PIDController:
 
         # --- Attitude error → desired angular rates ---
         r_cur = quat_to_rotation_matrix(state.orientation)
-        # Error rotation: R_err = R_des^T @ R_cur  →  extract to angle-axis
-        r_err = r_des.T @ r_cur
+        # Error rotation: R_err = R_cur^T @ R_des  (current-to-desired)
+        r_err = r_cur.T @ r_des
         # Extract error angles (small-angle: off-diagonal elements)
         # This is the standard "vee map" for SO(3) error
         angle_error = (
@@ -318,8 +318,10 @@ class PIDController:
         )
 
         # Attitude P-controller → desired body rates
+        # R_err = R_cur^T @ R_des gives rotation FROM current TO desired,
+        # so we apply +kp * error to drive towards desired.
         att_kp = np.array(self._cfg.attitude_kp, dtype=np.float64)
-        desired_rates_body = -att_kp * angle_error
+        desired_rates_body = att_kp * angle_error
 
         # --- Rate loop ---
         # Current body angular rates from gyro (approximation: use zero if not available)
