@@ -91,7 +91,7 @@ class MockSimConfig:
     gyro_noise_std: float = 0.01
     accel_noise_std: float = 0.1
     gate_colour_bgr: tuple[int, int, int] = (0, 200, 255)
-    gate_thickness: int = 8
+    gate_thickness: int = 3
     drag_coeff: float = 0.3
     angular_drag: float = 5.0
 
@@ -377,7 +377,7 @@ class MockSimAdapter:
         lateral_dist = float(np.linalg.norm(lateral))
 
         # Pass-through: drone is past the gate plane and within a generous radius
-        gate_radius = 3.0  # generous radius for the mock sim
+        gate_radius = 4.0  # generous radius for the mock sim
 
         if 0.0 < dist_along < 3.0 and lateral_dist < gate_radius:
             self._gates_passed += 1

@@ -2,7 +2,7 @@
 
 **Last Updated:** 2026-04-04
 **Current Phase:** Phase 0 — Foundation
-**Current Step:** Step 7 — Integration (in progress)
+**Current Step:** Step 7 — Integration (vision corrections working)
 
 ---
 
@@ -69,11 +69,12 @@
 - [x] `drone_racing/logging/flight_logger.py` — telemetry recording to .npz
 - [x] `scripts/run_sim.py` — entry point that wires everything together
 - [x] Full pipeline: mock camera → detect → PnP → ESKF → plan → PID → command
-- [x] Drone completes a 4-gate circuit (1 lap with IMU-only ESKF) ← YOU ARE HERE
+- [x] Drone completes a 4-gate circuit (1 lap with IMU-only ESKF)
 - [x] End-to-end latency profiling: 2.8ms avg, 3.8ms p95 (well under 40ms)
 - [x] Flight data logger working, saves .npz files
-- [ ] PnP vision corrections producing accurate poses on synthetic images
-- [ ] Multiple laps with ESKF vision corrections enabled
+- [x] PnP vision corrections producing accurate poses (0.03-0.5m at <8m range)
+- [x] 1 lap with ESKF vision corrections enabled (position-only MEDIUM confidence)
+- [ ] Multiple laps — needs more gates visible per lap (currently only gate 1 detected)
 
 ### Step 8: MPCC Planner (Performance Upgrade)
 - [ ] `drone_racing/planning/mpcc.py` — CasADi-based MPCC solver

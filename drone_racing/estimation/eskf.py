@@ -325,6 +325,12 @@ class ESKF:
         # Kalman gain
         k = self._state.covariance @ h.T @ s_inv
 
+        # For position-only updates (MEDIUM confidence), zero out the gain
+        # for non-position states to prevent systematic PnP bias from
+        # corrupting velocity/orientation through cross-correlations.
+        if measurement.confidence != DetectionConfidence.HIGH:
+            k[3:, :] = 0.0
+
         # Error-state correction
         dx = k @ innovation
 

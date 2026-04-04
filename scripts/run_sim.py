@@ -147,9 +147,9 @@ def run_pipeline(
         accel_noise_std=config.estimation.accel_noise_std,
         gyro_bias_std=config.estimation.gyro_bias_std,
         accel_bias_std=config.estimation.accel_bias_std,
-        pnp_position_noise_std=2.0,  # very conservative — synthetic images are noisy
-        pnp_orientation_noise_std=0.5,
-        chi2_gate_threshold=100.0,  # permissive for synthetic images
+        pnp_position_noise_std=5.0,  # very weak corrections to preserve trajectory
+        pnp_orientation_noise_std=1.0,
+        chi2_gate_threshold=15.0,  # chi² threshold for 3/6-DOF at ~99% confidence
     )
     from drone_racing.utils.config import RacingConfig
 
@@ -260,11 +260,14 @@ def run_pipeline(
             tracker.assign_gate_map_ids(gate_projections)
 
             # PnP solve + ESKF correction
-            # Vision corrections disabled for mock sim — PnP accuracy on
-            # synthetic images needs improvement before re-enabling.
-            # TODO: re-enable when detector + PnP produce accurate poses
-            _measurements = pnp.solve_multiple(tracked, gates, gate_corners_3d_local)
-            _ = _measurements  # logged for analysis; correction disabled for now
+            measurements = pnp.solve_multiple(
+                tracked,
+                gates,
+                gate_corners_3d_local,
+                drone_state=eskf.state,
+            )
+            for meas in measurements:
+                eskf.correct(meas)
 
             t_pipe_end = time.perf_counter()
             pipeline_times.append((t_pipe_end - t_pipe_start) * 1000.0)
