@@ -1,0 +1,90 @@
+# AI Grand Prix — Default Configuration
+# All values in SI units (meters, radians, seconds)
+
+[course]
+name = "default"
+num_gates = 10  # placeholder until sim provides actual count
+
+[gate]
+# Standard racing gate dimensions (update when competition specifies)
+width_m = 1.5
+height_m = 1.5
+shape = "square"  # "square" or "rectangular"
+num_corners = 4   # outer corners; 8 if inner corners also detected
+
+# 3D corner positions relative to gate center, in gate frame
+# Ordered: top-left, top-right, bottom-right, bottom-left
+corners_3d = [
+    [-0.75,  0.75, 0.0],
+    [ 0.75,  0.75, 0.0],
+    [ 0.75, -0.75, 0.0],
+    [-0.75, -0.75, 0.0],
+]
+
+[camera]
+# Placeholder intrinsics — recalibrate with actual hardware
+fx = 600.0
+fy = 600.0
+cx = 640.0  # assuming 1280px wide
+cy = 360.0  # assuming 720px tall
+width = 1280
+height = 720
+distortion = [0.0, 0.0, 0.0, 0.0, 0.0]  # k1, k2, p1, p2, k3
+
+# Camera-to-body extrinsic (FPV camera tilted ~15° forward)
+# Rotation: body FRD to camera OpenCV convention
+tilt_deg = 15.0
+
+[estimation]
+imu_rate_hz = 200
+gyro_noise_std = 0.01       # rad/s
+accel_noise_std = 0.1       # m/s²
+gyro_bias_std = 0.001       # rad/s per sqrt(s)
+accel_bias_std = 0.01       # m/s² per sqrt(s)
+pnp_position_noise_std = 0.15  # meters
+pnp_orientation_noise_std = 0.05  # radians
+chi2_gate_threshold = 9.21  # 99% confidence for 2-DOF
+
+[control]
+# PID gains — tune in simulation
+position_kp = [2.0, 2.0, 3.0]
+position_ki = [0.0, 0.0, 0.1]
+position_kd = [1.5, 1.5, 2.0]
+
+velocity_kp = [4.0, 4.0, 5.0]
+attitude_kp = [8.0, 8.0, 4.0]
+rate_kp = [12.0, 12.0, 6.0]
+
+# Physical limits
+max_thrust = 1.0
+max_roll_rate = 8.0     # rad/s
+max_pitch_rate = 8.0    # rad/s
+max_yaw_rate = 4.0      # rad/s
+max_tilt_angle = 1.22   # ~70 degrees in radians
+
+[planner]
+# MPCC weights
+w_progress = 10.0
+w_contour = 1.0
+w_lag = 1.0
+w_input = 0.01
+horizon_steps = 30
+horizon_dt = 0.05  # seconds per step = 1.5s lookahead
+
+# Racing line
+spline_smoothing = 0.5
+gate_approach_offset_m = 2.0  # waypoint distance before/after each gate
+max_velocity_mps = 25.0       # conservative starting limit
+
+[perception]
+# Detector selection: "classical" or "neural"
+backend = "classical"
+confidence_threshold = 0.5
+min_corners = 4
+nms_iou_threshold = 0.45
+
+[logging]
+enabled = true
+output_dir = "logs/"
+log_images = false  # Enable for debugging, disable for performance
+log_rate_hz = 50

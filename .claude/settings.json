@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Write(drone_racing/**)",
+      "Write(tests/**)",
+      "Write(scripts/**)",
+      "Write(config/**)",
+      "Write(docs/**)",
+      "Bash(uv run *)",
+      "Bash(python *)",
+      "Bash(git *)",
+      "Bash(docker *)"
+    ],
+    "deny": [
+      "Write(drone_racing/control/safety.py)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write(*.py)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd ${PROJECT_ROOT} && uv run ruff check --fix ${CLAUDE_TOOL_INPUT_FILE_PATH} 2>/dev/null; uv run ruff format ${CLAUDE_TOOL_INPUT_FILE_PATH} 2>/dev/null; true"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv sync:*)",
+      "Bash(gh auth:*)",
+      "Bash(winget install:*)",
+      "Bash(export PATH=\"/c/Program Files/GitHub CLI:$PATH\")",
+      "Bash(gh --version)"
+    ]
+  }
+}

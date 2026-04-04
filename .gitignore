@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# uv
+.python-version
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Logs and data
+logs/
+*.log
+*.bag
+flight_data/
+
+# Models (too large for git — use DVC or git-lfs)
+models/*.onnx
+models/*.pt
+models/*.pth
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+CLAUDE.local.md
+
+# Competition credentials
+.env
+*.key
