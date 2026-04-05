@@ -228,6 +228,9 @@ class ESKF:
         q_d = self._discrete_process_noise(r_wb, dt)
         self._state.covariance = f_x @ self._state.covariance @ f_x.T + q_d
 
+        # Covariance capping — prevent runaway growth during IMU-only propagation
+        self._cap_covariance()
+
         return self._state
 
     def correct(self, measurement: PoseMeasurement) -> State:
@@ -325,14 +328,39 @@ class ESKF:
         # Kalman gain
         k = self._state.covariance @ h.T @ s_inv
 
-        # For position-only updates (MEDIUM confidence), zero out the gain
-        # for non-position states to prevent systematic PnP bias from
-        # corrupting velocity/orientation through cross-correlations.
+        # For position-only updates (MEDIUM confidence), attenuate gains
+        # for non-position states.  Orientation drift is the primary cause
+        # of state divergence — allow partial correction to prevent it.
         if measurement.confidence != DetectionConfidence.HIGH:
-            k[3:, :] = 0.0
+            k[3:6, :] *= 0.3  # reduced velocity correction
+            k[6:9, :] *= 0.1  # small orientation correction to fight drift
+            k[9:, :] = 0.0  # still zero bias from position-only
 
         # Error-state correction
         dx = k @ innovation
+
+        # Cap correction magnitude to prevent catastrophic state jumps
+        # from bad PnP solutions (especially with 4 coplanar corners).
+        pos_corr = float(np.linalg.norm(dx[_P]))
+        vel_corr = float(np.linalg.norm(dx[_V]))
+        ori_corr = float(np.linalg.norm(dx[_T]))
+        max_pos_corr = 2.0  # metres
+        max_vel_corr = 3.0  # m/s
+        max_ori_corr = 0.3  # radians (~17°)
+        if pos_corr > max_pos_corr or vel_corr > max_vel_corr or ori_corr > max_ori_corr:
+            scale = min(
+                max_pos_corr / max(pos_corr, 1e-9),
+                max_vel_corr / max(vel_corr, 1e-9),
+                max_ori_corr / max(ori_corr, 1e-9),
+            )
+            dx = dx * scale
+            logger.debug(
+                "ESKF: capping correction magnitude (pos=%.2f vel=%.2f ori=%.2f → scale=%.2f)",
+                pos_corr,
+                vel_corr,
+                ori_corr,
+                scale,
+            )
 
         # --- Inject error into nominal state ---
         self._state.position = self._state.position + dx[_P]
@@ -540,6 +568,44 @@ class ESKF:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    # Diagonal covariance caps (variance, not std-dev).
+    # Prevents runaway growth during long IMU-only propagation.
+    _COV_CAP = np.array(
+        [
+            10.0,
+            10.0,
+            10.0,  # position: ±3.2m
+            25.0,
+            25.0,
+            25.0,  # velocity: ±5 m/s
+            0.25,
+            0.25,
+            0.25,  # orientation: ±~29°
+            0.25,
+            0.25,
+            0.25,  # accel bias: ±0.5 m/s²
+            0.01,
+            0.01,
+            0.01,  # gyro bias: ±0.1 rad/s
+        ]
+    )
+
+    def _cap_covariance(self) -> None:
+        """Clamp covariance diagonal to prevent unbounded growth.
+
+        Standard practice in real-world EKFs.  Without capping, orientation
+        uncertainty couples into velocity via ``-R·[a×]·δθ·dt`` in the
+        transition matrix, causing exponential growth during aggressive
+        manoeuvres.
+        """
+        diag = np.diag(self._state.covariance)
+        cap = self._COV_CAP
+        if np.any(diag > cap):
+            scale = np.minimum(1.0, cap / np.maximum(diag, 1e-12))
+            # Scale rows and columns to preserve correlations proportionally
+            s = np.sqrt(scale)
+            self._state.covariance = s[:, np.newaxis] * self._state.covariance * s[np.newaxis, :]
 
     def _dt_from_last(self, timestamp_ns: int) -> float:
         """Compute dt in seconds from the current state timestamp.

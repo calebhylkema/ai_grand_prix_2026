@@ -41,8 +41,9 @@ from drone_racing.planning.spline import build_racing_line
 from drone_racing.sim.mock_adapter import MockSimAdapter, MockSimConfig
 from drone_racing.utils.config import RacingConfig, load_config
 from drone_racing.utils.types import (
+    DetectionConfidence,
     GateWaypoint,
-    State,
+    PoseMeasurement,
     Telemetry,
 )
 
@@ -100,6 +101,7 @@ def run_pipeline(
     debug: bool = False,
     log_path: str | None = None,
     controller_type: str = "pid",
+    use_perception: bool = True,
 ) -> dict[str, object]:
     """Run the full autonomy pipeline in the mock simulator.
 
@@ -115,6 +117,9 @@ def run_pipeline(
         Path to save the flight log. None = auto-generate.
     controller_type : str
         Controller to use: ``"pid"`` or ``"mpcc"``.
+    use_perception : bool
+        If True (default), use classical detector + PnP pipeline.
+        If False, use ground-truth-based synthetic measurements.
 
     Returns
     -------
@@ -126,7 +131,6 @@ def run_pipeline(
 
     # --- Build gate circuit ---
     gates = build_gate_circuit(config)
-    gate_corners_3d_local = config.gate.corners_3d_array
     logger = logging.getLogger(__name__)
     logger.info("Gate circuit: %d gates", len(gates))
 
@@ -144,21 +148,18 @@ def run_pipeline(
         gates=gates,
         config=MockSimConfig(max_time_s=max_time),
     )
-    detector = ClassicalDetector(camera_config=config.camera)
-    tracker = GateTracker()
-
-    # Increase PnP noise and chi2 threshold for mock sim's coarser detections
+    # Tune estimation for mock sim: no real IMU bias, PnP is reasonably accurate
     from drone_racing.utils.types import EstimationConfig
 
     mock_est = EstimationConfig(
         imu_rate_hz=config.estimation.imu_rate_hz,
         gyro_noise_std=config.estimation.gyro_noise_std,
         accel_noise_std=config.estimation.accel_noise_std,
-        gyro_bias_std=config.estimation.gyro_bias_std,
-        accel_bias_std=config.estimation.accel_bias_std,
-        pnp_position_noise_std=5.0,  # very weak corrections to preserve trajectory
-        pnp_orientation_noise_std=1.0,
-        chi2_gate_threshold=15.0,  # chi² threshold for 3/6-DOF at ~99% confidence
+        gyro_bias_std=1e-6,  # mock sim has no IMU bias — suppress random walk
+        accel_bias_std=1e-6,
+        pnp_position_noise_std=0.5,  # conservative — mock sim PnP can be noisy
+        pnp_orientation_noise_std=0.5,
+        chi2_gate_threshold=12.0,
     )
     from drone_racing.utils.config import RacingConfig
 
@@ -169,8 +170,13 @@ def run_pipeline(
         control=config.control,
         planner=config.planner,
     )
-    pnp = PnPSolver(config.camera, mock_est)
     eskf = ESKF(mock_config)
+
+    # Perception modules (only needed when use_perception=True)
+    gate_corners_3d_local = config.gate.corners_3d_array
+    detector = ClassicalDetector(camera_config=config.camera)
+    tracker = GateTracker()
+    pnp = PnPSolver(config.camera, mock_est, max_reprojection_px=50.0)
 
     # Override control gains for mock sim (gentler than real hardware)
     from drone_racing.utils.types import ControlConfig
@@ -239,6 +245,7 @@ def run_pipeline(
     wall_start = time.perf_counter()
     imu_count = 0
     frame_count = 0
+    correction_count = 0
     pipeline_times: list[float] = []
     prev_gates_passed = 0
 
@@ -262,65 +269,70 @@ def run_pipeline(
             frame, frame_ts = frame_result
             frame_count += 1
 
-            # Detect gates
-            detections = detector.detect(frame, frame_ts)
+            if use_perception:
+                # Full perception pipeline: Detect → Track → PnP → ESKF
+                detections = detector.detect(frame, frame_ts)
+                tracked = tracker.update(detections)
 
-            # Track gates
-            tracked = tracker.update(detections)
+                # Assign gate map IDs using current state estimate
+                gate_projections: dict[int, np.ndarray] = {}
+                est = eskf.state
+                r_wb = Rotation.from_quat(est.orientation).as_matrix()
+                r_cb = np.linalg.inv(
+                    Rotation.from_euler("y", -np.deg2rad(config.camera.tilt_deg)).as_matrix()
+                    @ np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]], dtype=np.float64)
+                )
+                r_cw = r_cb @ r_wb.T
+                t_cw = -r_cw @ est.position
+                k = config.camera.intrinsic_matrix
 
-            # Assign gate map IDs using current state estimate
-            # Project gate world positions to image plane for matching
-            gate_projections: dict[int, np.ndarray] = {}
-            est = eskf.state
-            r_wb = Rotation.from_quat(est.orientation).as_matrix()
-            r_cb = np.linalg.inv(
-                Rotation.from_euler("y", -np.deg2rad(config.camera.tilt_deg)).as_matrix()
-                @ np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]], dtype=np.float64)
-            )
-            r_cw = r_cb @ r_wb.T
-            t_cw = -r_cw @ est.position
-            k = config.camera.intrinsic_matrix
+                for gate in gates:
+                    pt_c = r_cw @ gate.position_w + t_cw
+                    if pt_c[2] > 0.5:
+                        px = k[0, 0] * pt_c[0] / pt_c[2] + k[0, 2]
+                        py = k[1, 1] * pt_c[1] / pt_c[2] + k[1, 2]
+                        gate_projections[gate.gate_id] = np.array([px, py])
 
-            for gate in gates:
-                pt_c = r_cw @ gate.position_w + t_cw
-                if pt_c[2] > 0.5:
-                    px = k[0, 0] * pt_c[0] / pt_c[2] + k[0, 2]
-                    py = k[1, 1] * pt_c[1] / pt_c[2] + k[1, 2]
-                    gate_projections[gate.gate_id] = np.array([px, py])
+                tracker.assign_gate_map_ids(gate_projections)
 
-            tracker.assign_gate_map_ids(gate_projections)
+                # PnP solve (tries all gates if ID unknown/wrong)
+                measurements = pnp.solve_multiple(
+                    tracked, gates, gate_corners_3d_local, drone_state=eskf.state
+                )
+            else:
+                # Synthetic measurements from ground truth (for testing
+                # estimation & control in isolation from perception)
+                measurements = []
+                visible = sim.get_visible_gate_measurements(
+                    position_noise_std=0.15,
+                    orientation_noise_std=0.05,
+                    max_distance=25.0,
+                )
+                for gate_id, noisy_pos, noisy_ori in visible:
+                    measurements.append(
+                        PoseMeasurement(
+                            timestamp_ns=frame_ts,
+                            position_w=noisy_pos,
+                            orientation_w=noisy_ori,
+                            position_noise_std=mock_est.pnp_position_noise_std,
+                            orientation_noise_std=mock_est.pnp_orientation_noise_std,
+                            confidence=DetectionConfidence.HIGH,
+                            gate_id=gate_id,
+                        )
+                    )
 
-            # PnP solve + ESKF correction
-            measurements = pnp.solve_multiple(
-                tracked,
-                gates,
-                gate_corners_3d_local,
-                drone_state=eskf.state,
-            )
             for meas in measurements:
                 eskf.correct(meas)
+                correction_count += 1
 
             t_pipe_end = time.perf_counter()
             pipeline_times.append((t_pipe_end - t_pipe_start) * 1000.0)
 
         # --- Planning + Control ---
-        # MPCC uses ground-truth state for accurate trajectory planning.
-        # The ESKF state is still used by the PID fallback and perception.
-        # TODO: improve ESKF so it can be used directly by the MPCC.
         current_state = eskf.state
 
         if mpcc_controller is not None:
-            mpcc_state = sim.state  # ground truth for MPCC
-            mpcc_state = State(
-                timestamp_ns=current_state.timestamp_ns,
-                position=mpcc_state.position,
-                velocity=mpcc_state.velocity,
-                orientation=mpcc_state.orientation,
-                accel_bias=current_state.accel_bias,
-                gyro_bias=current_state.gyro_bias,
-                covariance=current_state.covariance,
-            )
-            cmd = mpcc_controller.update(mpcc_state)
+            cmd = mpcc_controller.update(current_state)
         else:
             # PID cascade with lookahead
             progress = racing_line.closest_progress(current_state.position)
@@ -350,6 +362,24 @@ def run_pipeline(
         flight_log.log_state(current_state)
         flight_log.log_command(cmd)
         flight_log.log_ground_truth(sim.state)
+
+        # Periodic diagnostics (every 2s of sim time)
+        if imu_count % 400 == 0:
+            gt = sim.state
+            pos_err = float(np.linalg.norm(current_state.position - gt.position))
+            cov_trace = float(np.trace(current_state.covariance))
+            logger.info(
+                "DIAG t=%.1fs | pos_err=%.2fm | cov_tr=%.1f | corrections=%d | "
+                "est_z=%.2f gt_z=%.2f | est_pos=%s gt_pos=%s",
+                current_state.timestamp_ns * 1e-9,
+                pos_err,
+                cov_trace,
+                correction_count,
+                current_state.position[2],
+                gt.position[2],
+                np.array2string(current_state.position, precision=2),
+                np.array2string(gt.position, precision=2),
+            )
 
         # Gate passage events
         if sim.gates_passed > prev_gates_passed:
@@ -386,6 +416,7 @@ def run_pipeline(
     print("  SIMULATION COMPLETE")
     print("=" * 60)
     print(f"  Controller:       {controller_type.upper()}")
+    print(f"  Perception:       {'real' if use_perception else 'synthetic'}")
     print(f"  Gates passed:     {sim.gates_passed}")
     print(f"  Laps completed:   {sim.laps_completed}")
     print(f"  Sim time:         {sim_elapsed:.1f}s")
@@ -393,6 +424,7 @@ def run_pipeline(
     print(f"  Realtime factor:  {stats['realtime_factor']:.1f}x")
     print(f"  IMU samples:      {imu_count}")
     print(f"  Camera frames:    {frame_count}")
+    print(f"  Corrections:      {correction_count}")
     print(
         f"  Pipeline latency: {stats['mean_pipeline_ms']:.1f}ms avg, "
         f"{stats['p95_pipeline_ms']:.1f}ms p95, "
@@ -420,6 +452,11 @@ def main() -> None:
         choices=["pid", "mpcc"],
         help="Controller type: pid (default) or mpcc",
     )
+    parser.add_argument(
+        "--no-perception",
+        action="store_true",
+        help="Use synthetic measurements instead of real perception pipeline",
+    )
     args = parser.parse_args()
 
     # Setup logging
@@ -437,6 +474,7 @@ def main() -> None:
         debug=args.debug,
         log_path=args.log_path,
         controller_type=args.controller,
+        use_perception=not args.no_perception,
     )
 
 

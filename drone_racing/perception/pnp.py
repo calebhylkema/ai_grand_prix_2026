@@ -64,6 +64,7 @@ class PnPSolver:
         self,
         camera_config: CameraConfig,
         estimation_config: EstimationConfig,
+        max_reprojection_px: float = 10.0,
     ) -> None:
         self._camera_k = camera_config.intrinsic_matrix
         self._camera_dist = camera_config.distortion_coeffs
@@ -79,6 +80,7 @@ class PnPSolver:
         self._t_cb[:3, :3] = self._r_bc.T
 
         self._est_cfg = estimation_config
+        self._max_reproj_px = max_reprojection_px
 
     def _compute_approximate_t_cg(
         self,
@@ -255,7 +257,7 @@ class PnPSolver:
         logger.debug("PnP: gate %s reprojection error = %.2f px", gate.gate_id, reproj_err)
 
         # Reject solutions with high reprojection error
-        if reproj_err > 10.0:
+        if reproj_err > self._max_reproj_px:
             logger.debug(
                 "PnP: rejecting gate %s — reprojection error %.1f px too high",
                 gate.gate_id,
@@ -299,10 +301,11 @@ class PnPSolver:
         # Extract position and orientation
         position_w, orientation_w = matrix_to_pose(t_wb)
 
-        # Sanity check: PnP position should be close to current ESKF estimate
+        # Sanity check: PnP position should be close to current ESKF estimate.
+        # Use a generous threshold — the filter itself handles outliers via chi².
         if drone_state is not None:
             pos_diff = float(np.linalg.norm(position_w - drone_state.position))
-            if pos_diff > 5.0:
+            if pos_diff > 15.0:
                 logger.debug(
                     "PnP: rejecting gate %s — position %.1fm from ESKF estimate",
                     gate.gate_id,
@@ -344,8 +347,13 @@ class PnPSolver:
     ) -> list[PoseMeasurement]:
         """Solve PnP for multiple detections against a gate map.
 
-        Each detection is matched to the nearest gate by ID (if set) or
-        skipped if no match. All successful solutions are returned.
+        For each detection:
+        - If it has a ``gate_id``, try that gate first.
+        - Otherwise (or if the assigned gate fails), try **all** gates and
+          pick the solution with the lowest reprojection error.
+
+        This makes the PnP robust to incorrect gate-ID assignments from
+        the tracker, which can happen when the ESKF state drifts.
 
         Parameters
         ----------
@@ -364,21 +372,28 @@ class PnPSolver:
             Successful pose measurements (may be empty).
         """
         gate_by_id: dict[int, GateWaypoint] = {g.gate_id: g for g in gates}
+        used_gate_ids: set[int] = set()
 
         measurements: list[PoseMeasurement] = []
         for det in detections:
-            if det.gate_id is None:
-                logger.debug("PnP: detection has no gate_id — skipping")
-                continue
+            meas: PoseMeasurement | None = None
 
-            gate = gate_by_id.get(det.gate_id)
-            if gate is None:
-                logger.debug("PnP: no gate with id=%d in map — skipping", det.gate_id)
-                continue
+            # Try the assigned gate_id first (fast path)
+            if det.gate_id is not None:
+                gate = gate_by_id.get(det.gate_id)
+                if gate is not None:
+                    meas = self.solve(det, gate, gate_corners_3d_local, drone_state)
 
-            meas = self.solve(det, gate, gate_corners_3d_local, drone_state)
+            # Fallback: try all gates, pick lowest reproj error
+            if meas is None:
+                meas = self._solve_best_gate(
+                    det, gates, gate_corners_3d_local, drone_state, used_gate_ids
+                )
+
             if meas is not None:
                 measurements.append(meas)
+                if meas.gate_id is not None:
+                    used_gate_ids.add(meas.gate_id)
 
         logger.debug(
             "PnP: %d/%d detections produced measurements",
@@ -386,3 +401,67 @@ class PnPSolver:
             len(detections),
         )
         return measurements
+
+    def _solve_best_gate(
+        self,
+        detection: GateDetection,
+        gates: list[GateWaypoint],
+        gate_corners_3d_local: np.ndarray,
+        drone_state: State | None,
+        exclude_ids: set[int],
+    ) -> PoseMeasurement | None:
+        """Try PnP against all gates and return the best match.
+
+        Parameters
+        ----------
+        detection : GateDetection
+            Detected 2D corners.
+        gates : list[GateWaypoint]
+            All known gates.
+        gate_corners_3d_local : np.ndarray
+            (N, 3) gate corners in gate local frame.
+        drone_state : State | None
+            Approximate drone state.
+        exclude_ids : set[int]
+            Gate IDs already matched to other detections in this frame.
+
+        Returns
+        -------
+        PoseMeasurement | None
+            Best matching measurement, or None.
+        """
+        best_meas: PoseMeasurement | None = None
+        best_reproj = float("inf")
+
+        for gate in gates:
+            if gate.gate_id in exclude_ids:
+                continue
+
+            # Quick distance check to avoid solving PnP for far-away gates
+            if drone_state is not None:
+                dist_to_gate = float(np.linalg.norm(gate.position_w - drone_state.position))
+                if dist_to_gate > 20.0:
+                    continue
+
+            try:
+                meas = self.solve(detection, gate, gate_corners_3d_local, drone_state)
+            except cv2.error:
+                continue
+            if meas is None:
+                continue
+
+            # Use position noise as a proxy for quality — lower noise = closer
+            # gate = more reliable match (noise scales with distance).
+            reproj_proxy = meas.position_noise_std
+            if reproj_proxy < best_reproj:
+                best_reproj = reproj_proxy
+                best_meas = meas
+
+        if best_meas is not None:
+            logger.debug(
+                "PnP: best-gate match → gate %s (noise=%.2f)",
+                best_meas.gate_id,
+                best_reproj,
+            )
+
+        return best_meas

@@ -353,6 +353,57 @@ class MockSimAdapter:
             gyro_rps=np.zeros(3),
         )
 
+    def get_visible_gate_measurements(
+        self,
+        position_noise_std: float = 0.3,
+        orientation_noise_std: float = 0.15,
+        max_distance: float = 12.0,
+        fov_half_angle: float = 1.0,
+    ) -> list[tuple[int, np.ndarray, np.ndarray]]:
+        """Generate synthetic pose measurements for visible gates.
+
+        Uses ground-truth drone pose to determine which gates are visible,
+        then adds Gaussian noise.  Bypasses the classical detector + PnP
+        pipeline to allow testing estimation and control in isolation.
+
+        Parameters
+        ----------
+        position_noise_std : float
+            Standard deviation of position noise (m).
+        orientation_noise_std : float
+            Standard deviation of orientation noise (rad).
+        max_distance : float
+            Maximum distance (m) for gate visibility.
+        fov_half_angle : float
+            Half-angle of the camera FoV cone (rad).
+
+        Returns
+        -------
+        list[tuple[int, np.ndarray, np.ndarray]]
+            List of (gate_id, noisy_position_w, noisy_orientation_w) for
+            each visible gate.
+        """
+        p = self._physics
+
+        visible: list[tuple[int, np.ndarray, np.ndarray]] = []
+        for gate in self._gates:
+            to_gate = gate.position_w - p.position
+            dist = float(np.linalg.norm(to_gate))
+            if dist > max_distance or dist < 0.5:
+                continue
+
+            # Add noise to drone position (not gate position)
+            noisy_pos = p.position + self._rng.normal(0, position_noise_std, 3)
+            noisy_ori = p.orientation.copy()
+            # Small orientation perturbation
+            delta_angle = self._rng.normal(0, orientation_noise_std, 3)
+            dq = small_angle_to_quat(delta_angle)
+            noisy_ori = quat_normalize(quat_multiply(noisy_ori, dq))
+
+            visible.append((gate.gate_id, noisy_pos, noisy_ori))
+
+        return visible
+
     # ------------------------------------------------------------------
     # Gate passage detection
     # ------------------------------------------------------------------
@@ -411,20 +462,25 @@ class MockSimAdapter:
         r_cw = self._r_cb @ r_wb.T  # world-to-camera rotation
         t_cw = -r_cw @ self._physics.position  # world-to-camera translation
 
+        b, g, r = self._cfg.gate_colour_bgr
+        colour_rgb = (r, g, b)
+
         for gate in self._gates:
             corners_w = gate.corners_3d_w  # (N, 3) in world frame
             pixels = self._project_points(corners_w, r_cw, t_cw)
             if pixels is None:
                 continue
 
-            # Draw the gate as a coloured polygon
+            # Draw the gate as a filled coloured polygon, then punch out the
+            # inner region in background colour to create a visible gate frame.
             pts = pixels.reshape((-1, 1, 2)).astype(np.int32)
-            # Convert RGB gate colour for drawing (image is RGB)
-            b, g, r = self._cfg.gate_colour_bgr
-            colour_rgb = (r, g, b)
-            cv2.polylines(
-                image, [pts], isClosed=True, color=colour_rgb, thickness=self._cfg.gate_thickness
-            )
+            cv2.fillPoly(image, [pts], colour_rgb)
+
+            # Shrink corners toward centroid to create inner cutout
+            centroid = pixels.mean(axis=0)
+            shrink = 0.65  # inner hole is 65% the size of the outer frame
+            inner = (centroid + shrink * (pixels - centroid)).reshape((-1, 1, 2)).astype(np.int32)
+            cv2.fillPoly(image, [inner], (128, 128, 128))
 
         return image
 
