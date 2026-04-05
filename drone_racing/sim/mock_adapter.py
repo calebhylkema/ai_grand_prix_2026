@@ -156,6 +156,7 @@ class MockSimAdapter:
 
         # Next gate index for completion tracking
         self._next_gate_idx = 0
+        self._gate_approached = False
         self._gates_passed = 0
         self._laps_completed = 0
 
@@ -188,6 +189,7 @@ class MockSimAdapter:
         self._last_imu_ns = telemetry.timestamp_ns
         self._last_cam_ns = telemetry.timestamp_ns
         self._next_gate_idx = 0
+        self._gate_approached = False
         self._gates_passed = 0
         self._laps_completed = 0
         self._running = True
@@ -409,7 +411,16 @@ class MockSimAdapter:
     # ------------------------------------------------------------------
 
     def _check_gate_passage(self) -> None:
-        """Check if the drone has passed through the next gate."""
+        """Check if the drone has passed through the next gate.
+
+        Uses a two-phase approach:
+        1. **Approach phase**: drone must first be in front of the gate
+           (dist_along < 0, approaching the gate plane).
+        2. **Passage phase**: drone crosses the gate plane and is within
+           a generous radius.
+
+        This prevents false positives from starting behind a gate.
+        """
         if len(self._gates) == 0:
             return
 
@@ -420,18 +431,23 @@ class MockSimAdapter:
         # Vector from gate centre to drone
         to_drone = self._physics.position - gate.position_w
 
-        # Distance along gate normal (signed)
+        # Distance along gate normal (signed: negative = approaching, positive = past)
         dist_along = float(np.dot(to_drone, gate_normal))
 
         # Lateral distance (perpendicular to normal)
         lateral = to_drone - dist_along * gate_normal
         lateral_dist = float(np.linalg.norm(lateral))
 
+        # Must approach from the front first (dist_along < 0)
+        if dist_along < -0.5 and lateral_dist < 10.0:
+            self._gate_approached = True
+
         # Pass-through: drone is past the gate plane and within a generous radius
         gate_radius = 4.0  # generous radius for the mock sim
 
-        if 0.0 < dist_along < 3.0 and lateral_dist < gate_radius:
+        if self._gate_approached and 0.0 < dist_along < 3.0 and lateral_dist < gate_radius:
             self._gates_passed += 1
+            self._gate_approached = False  # reset for next gate
             self._next_gate_idx = (self._next_gate_idx + 1) % len(self._gates)
             if self._next_gate_idx == 0:
                 self._laps_completed += 1
