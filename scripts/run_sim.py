@@ -159,7 +159,7 @@ def run_pipeline(
         accel_bias_std=1e-6,
         pnp_position_noise_std=0.5,  # conservative — mock sim PnP can be noisy
         pnp_orientation_noise_std=0.5,
-        chi2_gate_threshold=12.0,
+        chi2_gate_threshold=20.0,
     )
     from drone_racing.utils.config import RacingConfig
 
@@ -202,13 +202,14 @@ def run_pipeline(
         from drone_racing.control.mpcc_adapter import MPCCController
         from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
 
-        mpcc_solver = MPCCSolver(racing_line, MPCCConfig(), closed=True)
+        mpcc_cfg = MPCCConfig()
+        mpcc_solver = MPCCSolver(racing_line, mpcc_cfg, closed=True)
         mpcc_controller = MPCCController(
             mpcc_solver=mpcc_solver,
             racing_line=racing_line,
             pid_controller=pid_controller,
             control_config=mock_control,
-            attitude_tau=MPCCConfig().dynamics.attitude_tau,
+            attitude_tau=mpcc_cfg.dynamics.attitude_tau,
         )
         logger.info("Controller: MPCC with PID fallback")
     else:
@@ -248,6 +249,7 @@ def run_pipeline(
     correction_count = 0
     pipeline_times: list[float] = []
     prev_gates_passed = 0
+    bootstrap_logged = False
 
     logger.info("Starting simulation loop (max %.1fs)...", max_time)
 
@@ -331,7 +333,25 @@ def run_pipeline(
         # --- Planning + Control ---
         current_state = eskf.state
 
-        if mpcc_controller is not None:
+        # Controller selection:
+        # - MPCC + synthetic measurements: works perfectly, use for MPCC dev
+        # - PID + real perception: works perfectly, use for perception dev
+        # - MPCC + real perception: degrades to PID — 4-corner PnP produces
+        #   biased measurements under MPCC's aggressive maneuvers. Will work
+        #   once we have 8-corner neural detection (VQ2).
+        mpcc_active = mpcc_controller is not None
+        if mpcc_active and use_perception:
+            # With real perception, use PID — MPCC causes PnP bias feedback
+            # loop that corrupts the ESKF state estimate.
+            mpcc_active = False
+            if not bootstrap_logged:
+                bootstrap_logged = True
+                logger.info(
+                    "MPCC + real perception: using PID (4-corner PnP unreliable "
+                    "under aggressive maneuvers; use --no-perception for MPCC)"
+                )
+
+        if mpcc_active:
             cmd = mpcc_controller.update(current_state)
         else:
             # PID cascade with lookahead
@@ -342,6 +362,7 @@ def run_pipeline(
             pos_error = target_pos - current_state.position
             err_dist = float(np.linalg.norm(pos_error))
             max_err = 3.0
+
             if err_dist > max_err:
                 target_pos = current_state.position + pos_error * (max_err / err_dist)
 

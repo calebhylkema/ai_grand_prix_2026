@@ -269,10 +269,18 @@ class PnPSolver:
         r_cg, _ = cv2.Rodrigues(rvec)
         t_cg_vec = tvec.flatten()
 
-        # Reject if gate is too far away (PnP unreliable at distance due to
-        # small angular errors amplifying to large position errors)
+        # Reject if gate is too close (PnP unreliable with 4 coplanar
+        # points at extreme viewing angles) or too far away (small angular
+        # errors amplify to large position errors)
         distance = float(np.linalg.norm(t_cg_vec))
-        if distance > 12.0:
+        if distance < 2.0:
+            logger.debug(
+                "PnP: rejecting gate %s — distance %.1fm too close",
+                gate.gate_id,
+                distance,
+            )
+            return None
+        if distance > 18.0:
             logger.debug(
                 "PnP: rejecting gate %s — distance %.1fm too far",
                 gate.gate_id,
@@ -440,7 +448,7 @@ class PnPSolver:
             # Quick distance check to avoid solving PnP for far-away gates
             if drone_state is not None:
                 dist_to_gate = float(np.linalg.norm(gate.position_w - drone_state.position))
-                if dist_to_gate > 20.0:
+                if dist_to_gate > 25.0:
                     continue
 
             try:

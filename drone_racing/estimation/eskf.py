@@ -112,6 +112,7 @@ class ESKF:
         self._imu_buffer: deque[_ImuBufferEntry] = deque(maxlen=max_entries)
 
         self._initialised = False
+        self._consecutive_rejections = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -315,15 +316,30 @@ class ESKF:
 
         chi2 = float(innovation @ s_inv @ innovation)
         if chi2 > self._cfg.chi2_gate_threshold:
+            self._consecutive_rejections += 1
             logger.warning(
                 "Chi² = %.2f > threshold %.2f — rejecting measurement (gate=%s)",
                 chi2,
                 self._cfg.chi2_gate_threshold,
                 measurement.gate_id,
             )
+            # Covariance inflation after many consecutive rejections.
+            # This widens the chi² acceptance region so the filter can
+            # re-acquire lock after transient divergence.
+            if self._consecutive_rejections >= 10:
+                inflate = 1.5
+                self._state.covariance *= inflate
+                self._cap_covariance()
+                self._consecutive_rejections = 0
+                logger.info(
+                    "ESKF: inflated covariance (%.0f consecutive rejections)",
+                    10.0,
+                )
             if rolled_back:
                 self._repropagate_from(imu_to_replay)
             return self._state
+
+        self._consecutive_rejections = 0
 
         # Kalman gain
         k = self._state.covariance @ h.T @ s_inv
@@ -344,9 +360,9 @@ class ESKF:
         pos_corr = float(np.linalg.norm(dx[_P]))
         vel_corr = float(np.linalg.norm(dx[_V]))
         ori_corr = float(np.linalg.norm(dx[_T]))
-        max_pos_corr = 2.0  # metres
-        max_vel_corr = 3.0  # m/s
-        max_ori_corr = 0.3  # radians (~17°)
+        max_pos_corr = 0.3  # metres — keep tight to prevent biased PnP accumulation
+        max_vel_corr = 0.5  # m/s
+        max_ori_corr = 0.1  # radians (~6°)
         if pos_corr > max_pos_corr or vel_corr > max_vel_corr or ori_corr > max_ori_corr:
             scale = min(
                 max_pos_corr / max(pos_corr, 1e-9),
