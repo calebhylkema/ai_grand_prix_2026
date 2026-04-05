@@ -3,12 +3,17 @@
 
 Pipeline::
 
-    Mock Camera → Classical Detect → Tracker → PnP → ESKF → Racing Line → PID → Command → Physics
+    Mock Camera → Classical Detect → Tracker → PnP → ESKF → Racing Line → Controller → Command → Physics
+
+Controller options:
+    - ``pid`` (default): PID cascade with lookahead on the racing line
+    - ``mpcc``: MPCC trajectory optimiser with PID fallback (safety ladder)
 
 Usage::
 
     uv run python scripts/run_sim.py
-    uv run python scripts/run_sim.py --max-time 30 --debug
+    uv run python scripts/run_sim.py --controller mpcc --max-time 30
+    uv run python scripts/run_sim.py --controller pid --debug
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ from drone_racing.sim.mock_adapter import MockSimAdapter, MockSimConfig
 from drone_racing.utils.config import RacingConfig, load_config
 from drone_racing.utils.types import (
     GateWaypoint,
+    State,
     Telemetry,
 )
 
@@ -93,6 +99,7 @@ def run_pipeline(
     max_time: float = 60.0,
     debug: bool = False,
     log_path: str | None = None,
+    controller_type: str = "pid",
 ) -> dict[str, object]:
     """Run the full autonomy pipeline in the mock simulator.
 
@@ -106,6 +113,8 @@ def run_pipeline(
         If True, enable verbose logging.
     log_path : str | None
         Path to save the flight log. None = auto-generate.
+    controller_type : str
+        Controller to use: ``"pid"`` or ``"mpcc"``.
 
     Returns
     -------
@@ -179,7 +188,26 @@ def run_pipeline(
         max_yaw_rate=3.0,
         max_tilt_angle=0.8,  # ~45 degrees max tilt
     )
-    controller = PIDController(mock_control)
+    pid_controller = PIDController(mock_control)
+
+    # Build MPCC controller if requested
+    mpcc_controller = None
+    if controller_type == "mpcc":
+        from drone_racing.control.mpcc_adapter import MPCCController
+        from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
+
+        mpcc_solver = MPCCSolver(racing_line, MPCCConfig(), closed=True)
+        mpcc_controller = MPCCController(
+            mpcc_solver=mpcc_solver,
+            racing_line=racing_line,
+            pid_controller=pid_controller,
+            control_config=mock_control,
+            attitude_tau=MPCCConfig().dynamics.attitude_tau,
+        )
+        logger.info("Controller: MPCC with PID fallback")
+    else:
+        logger.info("Controller: PID cascade")
+
     rate_limiter = CommandRateLimiter()
     flight_log = FlightLogger()
 
@@ -199,7 +227,10 @@ def run_pipeline(
 
     sim.reset(start_telemetry)
     eskf.initialise(start_telemetry)
-    controller.reset()
+    pid_controller.reset()
+    if mpcc_controller is not None:
+        start_progress = racing_line.closest_progress(start_pos)
+        mpcc_controller.reset(progress=start_progress)
 
     flight_log.set_metadata("start_position", start_pos)
     flight_log.set_metadata("num_gates", len(gates))
@@ -273,33 +304,45 @@ def run_pipeline(
             pipeline_times.append((t_pipe_end - t_pipe_start) * 1000.0)
 
         # --- Planning + Control ---
+        # MPCC uses ground-truth state for accurate trajectory planning.
+        # The ESKF state is still used by the PID fallback and perception.
+        # TODO: improve ESKF so it can be used directly by the MPCC.
         current_state = eskf.state
-        progress = racing_line.closest_progress(current_state.position)
-        # Look ahead for the setpoint (wrap around for closed loop)
-        lookahead = (progress + 0.015) % 1.0
-        target_pos, target_tangent, target_speed = racing_line.at_progress(lookahead)
 
-        # Clamp the position setpoint to be at most 3m from current position
-        # This prevents the PID from over-tilting when the setpoint is far away
-        pos_error = target_pos - current_state.position
-        err_dist = float(np.linalg.norm(pos_error))
-        max_err = 3.0
-        if err_dist > max_err:
-            target_pos = current_state.position + pos_error * (max_err / err_dist)
+        if mpcc_controller is not None:
+            mpcc_state = sim.state  # ground truth for MPCC
+            mpcc_state = State(
+                timestamp_ns=current_state.timestamp_ns,
+                position=mpcc_state.position,
+                velocity=mpcc_state.velocity,
+                orientation=mpcc_state.orientation,
+                accel_bias=current_state.accel_bias,
+                gyro_bias=current_state.gyro_bias,
+                covariance=current_state.covariance,
+            )
+            cmd = mpcc_controller.update(mpcc_state)
+        else:
+            # PID cascade with lookahead
+            progress = racing_line.closest_progress(current_state.position)
+            lookahead = (progress + 0.015) % 1.0
+            target_pos, target_tangent, target_speed = racing_line.at_progress(lookahead)
 
-        # Compute desired yaw: face the tangent direction
-        desired_yaw = float(np.arctan2(target_tangent[1], target_tangent[0]))
+            pos_error = target_pos - current_state.position
+            err_dist = float(np.linalg.norm(pos_error))
+            max_err = 3.0
+            if err_dist > max_err:
+                target_pos = current_state.position + pos_error * (max_err / err_dist)
 
-        # Feed-forward velocity along the path tangent for faster progress
-        ff_velocity = target_tangent * min(target_speed, 8.0) * 0.4
+            desired_yaw = float(np.arctan2(target_tangent[1], target_tangent[0]))
+            ff_velocity = target_tangent * min(target_speed, 8.0) * 0.4
 
-        setpoint = TrajectorySetpoint(
-            position=target_pos,
-            velocity=ff_velocity,
-            yaw=desired_yaw,
-        )
+            setpoint = TrajectorySetpoint(
+                position=target_pos,
+                velocity=ff_velocity,
+                yaw=desired_yaw,
+            )
+            cmd = pid_controller.update(current_state, setpoint)
 
-        cmd = controller.update(current_state, setpoint)
         cmd = rate_limiter.limit(cmd)
         sim.send_command(cmd)
 
@@ -319,6 +362,7 @@ def run_pipeline(
     sim_elapsed = eskf.state.timestamp_ns * 1e-9
 
     stats: dict[str, object] = {
+        "controller": controller_type,
         "gates_passed": sim.gates_passed,
         "laps_completed": sim.laps_completed,
         "sim_time_s": sim_elapsed,
@@ -341,6 +385,7 @@ def run_pipeline(
     print("\n" + "=" * 60)
     print("  SIMULATION COMPLETE")
     print("=" * 60)
+    print(f"  Controller:       {controller_type.upper()}")
     print(f"  Gates passed:     {sim.gates_passed}")
     print(f"  Laps completed:   {sim.laps_completed}")
     print(f"  Sim time:         {sim_elapsed:.1f}s")
@@ -368,6 +413,13 @@ def main() -> None:
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--log-path", type=str, default=None, help="Flight log output path")
+    parser.add_argument(
+        "--controller",
+        type=str,
+        default="pid",
+        choices=["pid", "mpcc"],
+        help="Controller type: pid (default) or mpcc",
+    )
     args = parser.parse_args()
 
     # Setup logging
@@ -379,7 +431,13 @@ def main() -> None:
     )
 
     config = load_config(args.config)
-    run_pipeline(config, max_time=args.max_time, debug=args.debug, log_path=args.log_path)
+    run_pipeline(
+        config,
+        max_time=args.max_time,
+        debug=args.debug,
+        log_path=args.log_path,
+        controller_type=args.controller,
+    )
 
 
 if __name__ == "__main__":

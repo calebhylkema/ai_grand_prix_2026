@@ -112,6 +112,44 @@ def _make_l_shaped_racing_line(num_points: int = 60) -> RacingLine:
     )
 
 
+def _make_closed_circuit(num_points: int = 200) -> RacingLine:
+    """Build a closed square gate circuit with realistic horizontal orientations."""
+    from scipy.spatial.transform import Rotation
+
+    from drone_racing.planning.spline import build_racing_line
+
+    gate_positions = np.array(
+        [
+            [5.0, 0.0, 2.0],
+            [5.0, 5.0, 2.0],
+            [0.0, 5.0, 2.0],
+            [0.0, 0.0, 2.0],
+        ]
+    )
+
+    def _quat_from_normal(normal: list[float]) -> np.ndarray:
+        r = Rotation.align_vectors([normal], [[0, 0, 1]])[0]
+        return r.as_quat()
+
+    gate_orientations = np.array(
+        [
+            _quat_from_normal([0, 1, 0]),
+            _quat_from_normal([-1, 0, 0]),
+            _quat_from_normal([0, -1, 0]),
+            _quat_from_normal([1, 0, 0]),
+        ]
+    )
+
+    class _Cfg:
+        gate_approach_offset_m = 0.5
+        max_velocity_mps = 10.0
+        smoothing_factor = 0.0
+
+    return build_racing_line(
+        gate_positions, gate_orientations, _Cfg(), num_points=num_points, closed=True
+    )
+
+
 def _eval_casadi(expr: casadi.SX, sym: casadi.SX, val: np.ndarray) -> np.ndarray:
     """Numerically evaluate a CasADi SX expression."""
     f = casadi.Function("f", [sym], [expr])
@@ -150,7 +188,7 @@ class TestContinuousDynamics:
         np.testing.assert_allclose(xdot_val[6:9], 0.0, atol=1e-10)
 
     def test_free_fall(self) -> None:
-        """With zero thrust, vertical acceleration should be -g."""
+        """With zero thrust and zero velocity, vertical acceleration should be -g."""
         cfg = DynamicsConfig()
         x = casadi.SX.sym("x", NX)
         u = casadi.SX.sym("u", NU)
@@ -158,7 +196,7 @@ class TestContinuousDynamics:
         xdot_expr = continuous_dynamics(x, u, cfg)
         xdot_fn = casadi.Function("xdot", [x, u], [xdot_expr])
 
-        x0 = np.zeros(NX)
+        x0 = np.zeros(NX)  # zero velocity → drag has no effect
         u0 = np.zeros(NU)  # zero thrust
 
         xdot_val = np.array(xdot_fn(x0, u0)).flatten()
@@ -229,7 +267,7 @@ class TestRK4Integration:
 
     def test_free_fall_integration(self) -> None:
         """Free fall for 0.1s should give vz ≈ -0.981, pz ≈ -0.0049."""
-        cfg = DynamicsConfig()
+        cfg = DynamicsConfig(drag_coeff=0.0)  # No drag for analytical comparison
         x = casadi.SX.sym("x", NX)
         u = casadi.SX.sym("u", NU)
 
@@ -248,7 +286,7 @@ class TestRK4Integration:
 
     def test_multi_step_energy(self) -> None:
         """Multiple RK4 steps in free fall should match analytical solution."""
-        cfg = DynamicsConfig()
+        cfg = DynamicsConfig(drag_coeff=0.0)  # No drag for analytical comparison
         x_sym = casadi.SX.sym("x", NX)
         u_sym = casadi.SX.sym("u", NU)
 
@@ -518,3 +556,63 @@ class TestMPCCSolver:
         assert sol.states.shape == (n + 1, NX)
         assert sol.inputs.shape == (n, NU)
         assert sol.progress.shape == (n + 1,)
+
+    def test_closed_circuit_all_progress_values(self) -> None:
+        """Solver converges at all progress values on a closed circuit with turns."""
+        from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
+
+        rl = _make_closed_circuit()
+        solver = MPCCSolver(rl, MPCCConfig(), closed=True)
+
+        for start_prog in [0.05, 0.15, 0.25, 0.35, 0.50, 0.65, 0.80, 0.95]:
+            solver._prev_solution = None
+            pos, _tan, _spd = rl.at_progress(start_prog)
+            state = np.zeros(NX)
+            state[:3] = pos
+
+            sol = solver.solve(state, start_prog)
+            assert sol.success, f"Failed at progress={start_prog:.2f}"
+            assert sol.progress[-1] > start_prog
+
+    def test_consecutive_solves_all_succeed(self) -> None:
+        """20 consecutive warm-started solves should all succeed."""
+        from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
+
+        rl = _make_closed_circuit()
+        solver = MPCCSolver(rl, MPCCConfig(), closed=True)
+
+        pos, _tan, _spd = rl.at_progress(0.0)
+        state = np.zeros(NX)
+        state[:3] = pos
+        prog = 0.0
+
+        for step in range(20):
+            sol = solver.solve(state, prog)
+            assert sol.success, f"Failed at step {step}, progress={prog:.3f}"
+            state = sol.states[1]
+            prog = sol.progress[1]
+
+        assert prog > 0.01, "Drone should have made progress"
+
+    @pytest.mark.slow
+    def test_full_lap_completion(self) -> None:
+        """Solver completes a full lap on a closed circuit."""
+        from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
+
+        rl = _make_closed_circuit()
+        solver = MPCCSolver(rl, MPCCConfig(), closed=True)
+
+        pos, _tan, _spd = rl.at_progress(0.0)
+        state = np.zeros(NX)
+        state[:3] = pos
+        prog = 0.0
+
+        for step in range(500):
+            sol = solver.solve(state, prog)
+            assert sol.success, f"Failed at step {step}, progress={prog:.3f}"
+            state = sol.states[1]
+            prog = sol.progress[1]
+            if prog >= 1.0:
+                break
+
+        assert prog >= 1.0, f"Did not complete lap: progress={prog:.3f}"

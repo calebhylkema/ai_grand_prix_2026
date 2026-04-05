@@ -59,11 +59,12 @@ class DynamicsConfig:
     """
 
     mass: float = 1.5
-    max_thrust: float = 30.0
-    attitude_tau: float = 0.1
-    max_roll: float = 1.2
-    max_pitch: float = 1.2
-    max_yaw_rate: float = 4.0
+    max_thrust: float = 29.43
+    attitude_tau: float = 0.4
+    max_roll: float = 0.4
+    max_pitch: float = 0.4
+    max_yaw_rate: float = 3.0
+    drag_coeff: float = 0.3
 
 
 # State indices
@@ -118,9 +119,13 @@ def continuous_dynamics(
     # Acceleration in world frame (simplified rotation: small-angle body Z → world)
     # For a point-mass model, thrust acts along the body Z-axis which is
     # tilted by roll (phi) and pitch (theta) from vertical.
-    ax = (thrust / config.mass) * (ca.cos(psi) * ca.sin(theta) + ca.sin(psi) * ca.sin(phi))
-    ay = (thrust / config.mass) * (ca.sin(psi) * ca.sin(theta) - ca.cos(psi) * ca.sin(phi))
-    az = (thrust / config.mass) * ca.cos(phi) * ca.cos(theta) - _G
+    ax = (thrust / config.mass) * (
+        ca.cos(psi) * ca.sin(theta) + ca.sin(psi) * ca.sin(phi)
+    ) - config.drag_coeff * vx
+    ay = (thrust / config.mass) * (
+        ca.sin(psi) * ca.sin(theta) - ca.cos(psi) * ca.sin(phi)
+    ) - config.drag_coeff * vy
+    az = (thrust / config.mass) * ca.cos(phi) * ca.cos(theta) - _G - config.drag_coeff * vz
 
     # First-order attitude lag
     tau = config.attitude_tau

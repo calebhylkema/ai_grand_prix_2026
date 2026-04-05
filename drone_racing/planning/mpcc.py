@@ -12,12 +12,16 @@ where θ is the progress parameter along the racing line, e_c is the
 contouring error (perpendicular distance from path), and e_l is the lag
 error (distance along path from expected position).
 
-The solver uses CasADi with IPOPT for nonlinear optimisation.
+The solver uses CasADi with IPOPT for nonlinear optimisation.  Path
+interpolation uses CasADi's compiled ``interpolant`` for efficiency —
+this avoids the O(N) symbolic loop that would otherwise make the NLP
+graph enormous and slow to evaluate.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -63,19 +67,22 @@ class MPCCConfig:
         Weight on input magnitude (regularisation).
     w_input_rate : float
         Weight on input rate of change (smoothness).
+    max_progress_per_step : float
+        Maximum progress increment per step (prevents wrap-around issues).
     dynamics : DynamicsConfig
         Quadrotor dynamics parameters.
     solver_opts : dict
         Options passed to IPOPT solver.
     """
 
-    horizon: int = 20
+    horizon: int = 15
     dt: float = 0.05
-    w_progress: float = 10.0
-    w_contour: float = 5.0
-    w_lag: float = 5.0
-    w_input: float = 0.01
-    w_input_rate: float = 0.1
+    w_progress: float = 5.0
+    w_contour: float = 10.0
+    w_lag: float = 10.0
+    w_input: float = 0.1
+    w_input_rate: float = 0.5
+    max_progress_per_step: float = 0.02
     dynamics: DynamicsConfig = field(default_factory=DynamicsConfig)
     solver_opts: dict[str, object] = field(default_factory=dict)
 
@@ -123,73 +130,183 @@ class MPCCSolver:
         self,
         racing_line: RacingLine,
         config: MPCCConfig | None = None,
+        closed: bool = True,
     ) -> None:
         self._cfg = config or MPCCConfig()
         self._racing_line = racing_line
+        self._closed = closed
+        self._prev_solution: MPCCSolution | None = None
+
+        # Build CasADi interpolants for the racing line (compiled, fast)
+        self._build_path_interpolants()
+
+        # Build numpy propagation function for initial guess generation
+        self._build_numpy_propagator()
 
         # Pre-build the NLP
         self._build_nlp()
 
+    def _build_numpy_propagator(self) -> None:
+        """Build a CasADi Function for fast numpy-level state propagation."""
+        x_sym = ca.SX.sym("x", NX)
+        u_sym = ca.SX.sym("u", NU)
+        x_next = rk4_step(x_sym, u_sym, self._cfg.dt, self._cfg.dynamics)
+        self._propagate_fn = ca.Function("prop", [x_sym, u_sym], [x_next])
+
+    def _propagate_numpy(self, x: np.ndarray, u: np.ndarray, dt: float) -> np.ndarray:
+        """Propagate state one step using the pre-built CasADi function.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Current state (9,).
+        u : np.ndarray
+            Input (4,).
+        dt : float
+            Time step (unused — baked into the function).
+
+        Returns
+        -------
+        np.ndarray
+            Next state (9,).
+        """
+        return np.array(self._propagate_fn(x, u)).flatten()
+
+    def _build_path_interpolants(self) -> None:
+        """Build CasADi interpolant functions for path position and tangent.
+
+        Uses ``ca.interpolant`` with linear interpolation — this compiles to
+        efficient C code internally, avoiding the O(N) symbolic graph that
+        would result from looping over all racing line points.
+        """
+        positions = self._racing_line.positions  # (M, 3)
+        tangents = self._racing_line.tangents  # (M, 3)
+        n_pts = len(positions)
+
+        # Progress grid: uniform in [0, 1]
+        grid = np.linspace(0.0, 1.0, n_pts).tolist()
+
+        # CasADi interpolant expects 1D values, so build one per component.
+        # Use B-spline interpolation for C² smoothness — linear interpolants
+        # have discontinuous gradients at grid points, which causes IPOPT to
+        # cycle between two near-optimal points without converging.
+        self._pos_interp: list[ca.Function] = []
+        self._tan_interp: list[ca.Function] = []
+
+        for dim in range(3):
+            self._pos_interp.append(
+                ca.interpolant(f"pos_{dim}", "bspline", [grid], positions[:, dim].tolist())
+            )
+            self._tan_interp.append(
+                ca.interpolant(f"tan_{dim}", "bspline", [grid], tangents[:, dim].tolist())
+            )
+
+    def _path_at_progress(self, theta: ca.SX) -> tuple[ca.SX, ca.SX]:
+        """Interpolate the racing line at a symbolic progress value.
+
+        Uses pre-built CasADi interpolants for efficiency.
+
+        Parameters
+        ----------
+        theta : ca.SX
+            Progress parameter in [0, 1].
+
+        Returns
+        -------
+        tuple[ca.SX, ca.SX]
+            (position (3,), unit_tangent (3,)) at progress theta.
+        """
+        # For closed tracks, wrap theta to [0, 1) using fmod.
+        # For open tracks, clamp to [0, 1].
+        if self._closed:
+            theta_c = ca.fmod(theta, 1.0)
+            # fmod can return negative for negative inputs
+            theta_c = ca.fmin(ca.fmax(theta_c, 0.0), 1.0 - 1e-6)
+        else:
+            theta_c = ca.fmin(ca.fmax(theta, 0.0), 1.0)
+
+        pos = ca.vertcat(
+            self._pos_interp[0](theta_c),
+            self._pos_interp[1](theta_c),
+            self._pos_interp[2](theta_c),
+        )
+        tan = ca.vertcat(
+            self._tan_interp[0](theta_c),
+            self._tan_interp[1](theta_c),
+            self._tan_interp[2](theta_c),
+        )
+
+        # Normalise tangent
+        tan_norm = ca.norm_2(tan) + 1e-12
+        tan = tan / tan_norm
+
+        return pos, tan
+
     def _build_nlp(self) -> None:
         """Construct the CasADi NLP structure (called once at init)."""
-        n_horizon = self._cfg.horizon
+        n = self._cfg.horizon
         dt = self._cfg.dt
         dyn_cfg = self._cfg.dynamics
 
         # --- Decision variables ---
-        # States: x_0, x_1, ..., x_N  (N+1 states)
-        # Inputs: u_0, u_1, ..., u_{N-1}  (N inputs)
-        # Progress: theta_0, theta_1, ..., theta_N  (N+1 progress values)
-
+        # States: x_0 .. x_N  (N+1 states, each 9D)
+        # Inputs: u_0 .. u_{N-1}  (N inputs, each 4D)
+        # Progress: theta_0 .. theta_N  (N+1 scalars)
         self._x_vars: list[ca.SX] = []
         self._u_vars: list[ca.SX] = []
         self._theta_vars: list[ca.SX] = []
 
-        for k in range(n_horizon + 1):
+        for k in range(n + 1):
             self._x_vars.append(ca.SX.sym(f"x_{k}", NX))
             self._theta_vars.append(ca.SX.sym(f"theta_{k}", 1))
-        for k in range(n_horizon):
+        for k in range(n):
             self._u_vars.append(ca.SX.sym(f"u_{k}", NU))
 
         # Pack into a single decision vector
+        # Layout per step k: [x_k (9), theta_k (1), u_k (4)]
+        # Last step: [x_N (9), theta_N (1)] — no input
         w: list[ca.SX] = []
-        for k in range(n_horizon + 1):
+        for k in range(n + 1):
             w.append(self._x_vars[k])
             w.append(self._theta_vars[k])
-            if k < n_horizon:
+            if k < n:
                 w.append(self._u_vars[k])
         self._w = ca.vertcat(*w)
 
-        # --- Constraints ---
-        g: list[ca.SX] = []  # constraint expressions
-        lbg: list[float] = []  # lower bounds
-        ubg: list[float] = []  # upper bounds
+        # Compute per-step size for indexing
+        self._step_size = NX + 1 + NU  # state + progress + input
+        self._last_step_size = NX + 1  # final step has no input
 
-        # --- Cost ---
-        total_cost = ca.SX(0)
-
-        # Bounds on decision variables
-        lbw: list[float] = []
-        ubw: list[float] = []
-
+        # --- Bounds ---
         x_lb, x_ub = state_bounds(dyn_cfg)
         u_lb, u_ub = input_bounds(dyn_cfg)
 
-        for k in range(n_horizon + 1):
-            # State bounds
+        lbw: list[float] = []
+        ubw: list[float] = []
+
+        # For closed tracks, progress can grow beyond 1.0 (wraps via fmod in
+        # the path lookup).  Upper bound allows up to 2 full laps of progress
+        # in the horizon.  For open tracks, clamp to [0, 1].
+        theta_ub = 2.0 if self._closed else 1.0
+
+        for k in range(n + 1):
             lbw.extend(x_lb.tolist())
             ubw.extend(x_ub.tolist())
-            # Progress bounds: [0, 1]
             lbw.append(0.0)
-            ubw.append(1.0)
-
-            if k < n_horizon:
-                # Input bounds
+            ubw.append(theta_ub)
+            if k < n:
                 lbw.extend(u_lb.tolist())
                 ubw.extend(u_ub.tolist())
 
-        # --- Dynamics constraints + cost ---
-        for k in range(n_horizon):
+        # --- Constraints and cost ---
+        g: list[ca.SX] = []
+        lbg: list[float] = []
+        ubg: list[float] = []
+        total_cost = ca.SX(0)
+
+        max_dp = self._cfg.max_progress_per_step
+
+        for k in range(n):
             xk = self._x_vars[k]
             uk = self._u_vars[k]
             xk1 = self._x_vars[k + 1]
@@ -202,29 +319,25 @@ class MPCCSolver:
             lbg.extend([0.0] * NX)
             ubg.extend([0.0] * NX)
 
-            # Progress monotonicity: theta_{k+1} >= theta_k
-            g.append(thetak1 - thetak)
+            # Progress monotonicity: 0 <= theta_{k+1} - theta_k <= max_dp
+            d_theta = thetak1 - thetak
+            g.append(d_theta)
             lbg.append(0.0)
-            ubg.append(1.0)  # Don't allow more than full lap per step
+            ubg.append(max_dp)
 
             # --- Contouring and lag errors ---
-            # Get reference position and tangent at progress theta_k
             pos_k = ca.vertcat(xk[PX], xk[PY], xk[PZ])
-
-            # Reference path: interpolate from discretised racing line
             ref_pos, ref_tangent = self._path_at_progress(thetak)
 
-            # Error vector from reference to drone
             error_vec = pos_k - ref_pos
 
             # Lag error: component along tangent
             e_lag = ca.dot(error_vec, ref_tangent)
 
-            # Contouring error: perpendicular component
+            # Contouring error²: total error² - lag² (Pythagorean decomposition).
+            # With B-spline path interpolation this stays non-negative; any tiny
+            # numerical negativity from cancellation is harmless.
             e_contour_sq = ca.dot(error_vec, error_vec) - e_lag**2
-
-            # Progress increment
-            d_theta = thetak1 - thetak
 
             # Stage cost
             total_cost += (
@@ -244,23 +357,27 @@ class MPCCSolver:
         self._ubg = np.array(ubg)
         self._lbw = np.array(lbw)
         self._ubw = np.array(ubw)
-        self._total_cost = total_cost
 
         # --- Build solver ---
         nlp = {"x": self._w, "f": total_cost, "g": self._g}
 
         opts: dict[str, object] = {
             "ipopt.print_level": 0,
-            "ipopt.max_iter": 200,
-            "ipopt.tol": 1e-4,
+            "ipopt.max_iter": 50,
+            "ipopt.tol": 1e-3,
+            "ipopt.acceptable_tol": 1e-2,
+            "ipopt.acceptable_iter": 3,
             "ipopt.warm_start_init_point": "yes",
+            "ipopt.warm_start_bound_push": 1e-6,
+            "ipopt.warm_start_mult_bound_push": 1e-6,
+            "ipopt.mu_strategy": "adaptive",
+            "ipopt.mu_init": 1e-3,
             "print_time": 0,
         }
         opts.update(self._cfg.solver_opts)
 
         self._solver = ca.nlpsol("mpcc", "ipopt", nlp, opts)
 
-        # Store dimensions for warm-starting
         self._n_w = self._w.shape[0]
         self._w0 = np.zeros(self._n_w)
 
@@ -268,67 +385,87 @@ class MPCCSolver:
             "MPCC NLP built: %d vars, %d constraints, horizon=%d, dt=%.3fs",
             self._n_w,
             self._g.shape[0],
-            n_horizon,
+            n,
             dt,
         )
 
-    def _path_at_progress(self, theta: ca.SX) -> tuple[ca.SX, ca.SX]:
-        """Interpolate the racing line at a symbolic progress value.
+    def _build_initial_guess(
+        self,
+        current_state: np.ndarray,
+        current_progress: float,
+    ) -> np.ndarray:
+        """Build an initial guess for the NLP decision variables.
 
-        Uses piecewise-linear interpolation over the discretised racing line
-        points. This creates a CasADi expression that can be differentiated.
+        If a previous solution exists, shifts it forward by one step
+        (warm-start). Otherwise, uses a straight-line hover guess.
 
         Parameters
         ----------
-        theta : ca.SX
-            Progress parameter in [0, 1].
+        current_state : np.ndarray
+            Current drone state (9,).
+        current_progress : float
+            Current progress along the racing line [0, 1].
 
         Returns
         -------
-        tuple[ca.SX, ca.SX]
-            (position (3,), unit_tangent (3,)) at progress theta.
+        np.ndarray
+            Initial guess vector.
         """
-        positions = self._racing_line.positions  # (M, 3)
-        tangents = self._racing_line.tangents  # (M, 3)
-        n_pts = len(positions)
+        n = self._cfg.horizon
+        hover_thrust = self._cfg.dynamics.mass * 9.81 / self._cfg.dynamics.max_thrust
 
-        # Clamp theta to [0, 1]
-        theta_c = ca.fmin(ca.fmax(theta, 0.0), 1.0)
+        if self._prev_solution is not None and self._prev_solution.success:
+            # Shift previous solution forward by one step.
+            # Use RK4 to propagate the last state (keeps dynamics consistent).
+            prev = self._prev_solution
+            w0 = np.zeros(self._n_w)
+            offset = 0
 
-        # Continuous index
-        idx_f = theta_c * (n_pts - 1)
-        idx_lo = ca.floor(idx_f)
-        alpha = idx_f - idx_lo
+            for k in range(n + 1):
+                src_k = min(k + 1, n)
+                w0[offset : offset + NX] = prev.states[src_k]
+                offset += NX
+                w0[offset] = prev.progress[src_k]
+                offset += 1
+                if k < n:
+                    src_u = min(k + 1, n - 1)
+                    w0[offset : offset + NU] = prev.inputs[src_u]
+                    offset += NU
 
-        # We use a lookup approach: sum over all segments with an indicator
-        # For efficiency with CasADi, use a direct linear interpolation
-        # by constructing the interpolation with CasADi's interpolant
-        # However, for simplicity and robustness, we pre-build a CasADi
-        # interpolant using the discretised points.
+            # Override initial state and progress
+            w0[:NX] = current_state
+            w0[NX] = current_progress
+            return w0
 
-        # Simple approach: piecewise constant lookup with interpolation
-        # Use CasADi's conditional to handle this
-        pos = ca.SX.zeros(3)
-        tan = ca.SX.zeros(3)
+        # Cold start: forward-simulate from current state using hover inputs,
+        # with progress estimated from the resulting positions.
+        w0 = np.zeros(self._n_w)
+        offset = 0
 
-        for i in range(n_pts - 1):
-            # Weight for this segment: 1 when idx_lo == i, 0 otherwise
-            # Smooth approximation using soft indicator
-            w_i = ca.fmax(0, 1 - ca.fabs(idx_lo - i))
+        # Build a CasADi function for propagation
 
-            p0 = positions[i]
-            p1 = positions[i + 1]
-            t0 = tangents[i]
-            t1 = tangents[i + 1]
+        x_s = np.copy(current_state)
+        u_hover = np.array([hover_thrust, 0.0, 0.0, 0.0])
 
-            pos += w_i * ((1 - alpha) * p0 + alpha * p1)
-            tan += w_i * ((1 - alpha) * t0 + alpha * t1)
+        for k in range(n + 1):
+            w0[offset : offset + NX] = x_s
+            offset += NX
 
-        # Normalise tangent
-        tan_norm = ca.norm_2(tan) + 1e-12
-        tan = tan / tan_norm
+            # Progress from position
+            prog_k = self._racing_line.closest_progress(x_s[:3])
+            # Ensure monotonicity
+            if k > 0:
+                prog_k = max(prog_k, w0[offset - NX - 1])
+            w0[offset] = prog_k
+            offset += 1
 
-        return pos, tan
+            if k < n:
+                w0[offset : offset + NU] = u_hover
+                offset += NU
+                # Propagate state numerically (not symbolic)
+                x_s = self._propagate_numpy(x_s, u_hover, self._cfg.dt)
+
+        return w0
 
     def solve(
         self,
@@ -349,54 +486,25 @@ class MPCCSolver:
         MPCCSolution
             Optimal trajectory and inputs.
         """
-        import time
-
-        n_horizon = self._cfg.horizon
-
+        n = self._cfg.horizon
         t_start = time.perf_counter()
 
         # --- Set initial state constraint ---
-        # The first state is fixed to the current state
         lbw = self._lbw.copy()
         ubw = self._ubw.copy()
 
-        # State x_0 is fixed
-        # Find the offset of x_0 in the decision vector
-        # Layout per step k: x_k (NX), theta_k (1), [u_k (NU) if k < N]
-        # x_0 starts at index 0
+        # x_0 is fixed
         lbw[:NX] = current_state
         ubw[:NX] = current_state
 
-        # theta_0 is fixed to current progress
+        # theta_0 is fixed
         lbw[NX] = current_progress
         ubw[NX] = current_progress
 
-        # --- Warm start ---
-        w0 = self._w0.copy()
-        # Set initial guess for x_0
-        w0[:NX] = current_state
-        w0[NX] = current_progress
+        # --- Initial guess ---
+        w0 = self._build_initial_guess(current_state, current_progress)
 
-        # Propagate initial guess: constant input, linear progress
-        offset = 0
-        for k in range(n_horizon + 1):
-            # x_k
-            w0[offset : offset + NX] = current_state
-            offset += NX
-            # theta_k
-            w0[offset] = min(current_progress + k * 0.01, 1.0)
-            offset += 1
-            # u_k
-            if k < n_horizon:
-                # Hover input as initial guess
-                hover_thrust = self._cfg.dynamics.mass * 9.81 / self._cfg.dynamics.max_thrust
-                w0[offset + 0] = hover_thrust  # thrust
-                w0[offset + 1] = 0.0  # roll
-                w0[offset + 2] = 0.0  # pitch
-                w0[offset + 3] = 0.0  # yaw rate
-                offset += NU
-
-        # --- Solve ---
+        # --- Solve (primal warm-start only) ---
         sol = self._solver(
             x0=w0,
             lbx=lbw,
@@ -413,23 +521,32 @@ class MPCCSolver:
         success = self._solver.stats()["success"]
         cost = float(sol["f"])
 
-        # Unpack states, inputs, progress
-        states = np.zeros((n_horizon + 1, NX))
-        progress = np.zeros(n_horizon + 1)
-        inputs = np.zeros((n_horizon, NU))
+        states = np.zeros((n + 1, NX))
+        progress = np.zeros(n + 1)
+        inputs = np.zeros((n, NU))
 
         offset = 0
-        for k in range(n_horizon + 1):
+        for k in range(n + 1):
             states[k, :] = w_opt[offset : offset + NX]
             offset += NX
             progress[k] = w_opt[offset]
             offset += 1
-            if k < n_horizon:
+            if k < n:
                 inputs[k, :] = w_opt[offset : offset + NU]
                 offset += NU
 
         # Save for warm-starting next solve
         self._w0 = w_opt
+
+        result = MPCCSolution(
+            success=success,
+            states=states,
+            inputs=inputs,
+            progress=progress,
+            cost=cost,
+            solve_time_ms=solve_time_ms,
+        )
+        self._prev_solution = result
 
         logger.debug(
             "MPCC solved: success=%s, cost=%.3f, time=%.1fms, progress=%.3f→%.3f",
@@ -440,19 +557,13 @@ class MPCCSolver:
             progress[-1],
         )
 
-        return MPCCSolution(
-            success=success,
-            states=states,
-            inputs=inputs,
-            progress=progress,
-            cost=cost,
-            solve_time_ms=solve_time_ms,
-        )
+        return result
 
     @staticmethod
     def from_planner_config(
         racing_line: RacingLine,
         planner_config: PlannerConfig,
+        closed: bool = True,
     ) -> MPCCSolver:
         """Create an MPCCSolver from the standard PlannerConfig.
 
@@ -462,6 +573,8 @@ class MPCCSolver:
             Reference path.
         planner_config : PlannerConfig
             Planner parameters from TOML config.
+        closed : bool
+            Whether the racing line is a closed loop.
 
         Returns
         -------
@@ -476,4 +589,4 @@ class MPCCSolver:
             w_lag=planner_config.w_lag,
             w_input=planner_config.w_input,
         )
-        return MPCCSolver(racing_line, mpcc_cfg)
+        return MPCCSolver(racing_line, mpcc_cfg, closed=closed)
