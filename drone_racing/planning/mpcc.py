@@ -75,14 +75,14 @@ class MPCCConfig:
         Options passed to IPOPT solver.
     """
 
-    horizon: int = 15
+    horizon: int = 20
     dt: float = 0.05
-    w_progress: float = 5.0
-    w_contour: float = 10.0
-    w_lag: float = 10.0
-    w_input: float = 0.1
-    w_input_rate: float = 0.5
-    max_progress_per_step: float = 0.02
+    w_progress: float = 20.0
+    w_contour: float = 5.0
+    w_lag: float = 5.0
+    w_input: float = 0.05
+    w_input_rate: float = 0.1
+    max_progress_per_step: float = 0.03
     dynamics: DynamicsConfig = field(default_factory=DynamicsConfig)
     solver_opts: dict[str, object] = field(default_factory=dict)
 

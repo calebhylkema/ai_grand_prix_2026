@@ -60,9 +60,9 @@ class DynamicsConfig:
 
     mass: float = 1.5
     max_thrust: float = 29.43
-    attitude_tau: float = 0.4
-    max_roll: float = 0.4
-    max_pitch: float = 0.4
+    attitude_tau: float = 0.2
+    max_roll: float = 0.8
+    max_pitch: float = 0.8
     max_yaw_rate: float = 3.0
     drag_coeff: float = 0.3
 

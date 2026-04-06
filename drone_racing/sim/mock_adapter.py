@@ -156,7 +156,8 @@ class MockSimAdapter:
 
         # Next gate index for completion tracking
         self._next_gate_idx = 0
-        self._gate_approached = False
+        self._start_gate_idx = 0
+        self._prev_dist_along: float | None = None
         self._gates_passed = 0
         self._laps_completed = 0
 
@@ -188,12 +189,17 @@ class MockSimAdapter:
         )
         self._last_imu_ns = telemetry.timestamp_ns
         self._last_cam_ns = telemetry.timestamp_ns
-        self._next_gate_idx = 0
-        self._gate_approached = False
+        self._next_gate_idx = self._find_starting_gate(telemetry.position)
+        self._start_gate_idx = self._next_gate_idx
+        self._prev_dist_along = None
         self._gates_passed = 0
         self._laps_completed = 0
         self._running = True
-        logger.info("MockSim reset at pos=%s", telemetry.position)
+        logger.info(
+            "MockSim reset at pos=%s, starting from gate %d",
+            telemetry.position,
+            self._next_gate_idx,
+        )
 
     @property
     def state(self) -> State:
@@ -410,16 +416,57 @@ class MockSimAdapter:
     # Gate passage detection
     # ------------------------------------------------------------------
 
+    def _find_starting_gate(self, position: np.ndarray) -> int:
+        """Find the first gate the drone should target based on start position.
+
+        If the drone starts on the positive side of gate 0 (already past
+        it), skip ahead to gate 1 so the sequential detector doesn't stall.
+
+        Parameters
+        ----------
+        position : np.ndarray
+            Starting position in world frame.
+
+        Returns
+        -------
+        int
+            Index of the first gate to track.
+        """
+        if len(self._gates) == 0:
+            return 0
+
+        for i, gate in enumerate(self._gates):
+            r_wg = Rotation.from_quat(gate.orientation_w)
+            gate_normal = r_wg.apply(np.array([0.0, 0.0, 1.0]))
+            to_drone = position - gate.position_w
+            dist_along = float(np.dot(to_drone, gate_normal))
+            lateral_dist = float(np.linalg.norm(to_drone - dist_along * gate_normal))
+
+            # If we're on the negative side (approaching) and close, this is our gate
+            if dist_along < 0.0 and lateral_dist < 10.0:
+                return i
+
+            # If we're on the positive side (already past) and close, skip to next
+            if dist_along > 0.0 and lateral_dist < 10.0:
+                next_idx = (i + 1) % len(self._gates)
+                logger.info(
+                    "Start position is past gate %d (dist_along=%.1f) — starting from gate %d",
+                    i,
+                    dist_along,
+                    next_idx,
+                )
+                return next_idx
+
+        return 0
+
     def _check_gate_passage(self) -> None:
         """Check if the drone has passed through the next gate.
 
-        Uses a two-phase approach:
-        1. **Approach phase**: drone must first be in front of the gate
-           (dist_along < 0, approaching the gate plane).
-        2. **Passage phase**: drone crosses the gate plane and is within
-           a generous radius.
-
-        This prevents false positives from starting behind a gate.
+        Detects a gate-plane crossing: tracks ``dist_along`` (signed
+        distance along gate normal) and fires when it transitions from
+        negative to positive while the drone is within the gate radius.
+        The ``_prev_dist_along`` is initialised to ``None`` on reset so
+        we never fire on the very first physics step.
         """
         if len(self._gates) == 0:
             return
@@ -438,18 +485,21 @@ class MockSimAdapter:
         lateral = to_drone - dist_along * gate_normal
         lateral_dist = float(np.linalg.norm(lateral))
 
-        # Must approach from the front first (dist_along < 0)
-        if dist_along < -0.5 and lateral_dist < 10.0:
-            self._gate_approached = True
-
-        # Pass-through: drone is past the gate plane and within a generous radius
+        # Gate-plane crossing: drone crosses from negative to positive side.
+        # For the circuit layout, gate normals point opposite to the flight
+        # direction, so the drone approaches from negative and exits positive.
         gate_radius = 4.0  # generous radius for the mock sim
+        crossed = (
+            self._prev_dist_along is not None and self._prev_dist_along <= 0.0 and dist_along > 0.0
+        )
 
-        if self._gate_approached and 0.0 < dist_along < 3.0 and lateral_dist < gate_radius:
+        self._prev_dist_along = dist_along
+
+        if crossed and lateral_dist < gate_radius:
             self._gates_passed += 1
-            self._gate_approached = False  # reset for next gate
+            self._prev_dist_along = None  # reset for next gate
             self._next_gate_idx = (self._next_gate_idx + 1) % len(self._gates)
-            if self._next_gate_idx == 0:
+            if self._next_gate_idx == self._start_gate_idx:
                 self._laps_completed += 1
             logger.info(
                 "Gate %d passed! (total=%d, laps=%d)",
