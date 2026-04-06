@@ -30,6 +30,7 @@ logs/
 *.bag
 flight_data/
 data/
+runs/
 
 # Models (too large for git — use DVC or git-lfs)
 models/*.onnx
