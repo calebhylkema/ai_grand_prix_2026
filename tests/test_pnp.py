@@ -61,9 +61,10 @@ def solver(camera_config: CameraConfig, estimation_config: EstimationConfig) -> 
 
 
 def _gate_corners_local() -> np.ndarray:
-    """Standard 1.5m × 1.5m gate corners in gate-local frame.
+    """Standard 1.5m × 1.5m gate corners in gate-local frame (8 corners).
 
     Same as config/default.toml [gate] corners_3d.
+    First 4 are outer corners, last 4 are inner corners (65% scale).
     """
     return np.array(
         [
@@ -71,6 +72,10 @@ def _gate_corners_local() -> np.ndarray:
             [0.75, 0.75, 0.0],
             [0.75, -0.75, 0.0],
             [-0.75, -0.75, 0.0],
+            [-0.4875, 0.4875, 0.0],
+            [0.4875, 0.4875, 0.0],
+            [0.4875, -0.4875, 0.0],
+            [-0.4875, -0.4875, 0.0],
         ],
         dtype=np.float64,
     )
@@ -541,14 +546,42 @@ class TestPnPRejection:
 
 
 class TestPnPConfidenceCapping:
-    """4 coplanar corners → confidence capped at MEDIUM."""
+    """Confidence depends on corner count."""
+
+    def test_high_confidence_with_8_corners(
+        self, solver: PnPSolver, camera_config: CameraConfig
+    ) -> None:
+        """HIGH confidence detection with 8 model corners → stays HIGH."""
+        gate = _gate_at_origin()
+        corners_local = _gate_corners_local()  # 8 corners
+        assert len(corners_local) == 8
+
+        rvec = np.zeros(3)
+        tvec = np.array([0.0, 0.0, 4.0])
+        img_pts = _project_points(
+            corners_local,
+            rvec,
+            tvec,
+            camera_config.intrinsic_matrix,
+            camera_config.distortion_coeffs,
+        )
+        det = GateDetection(
+            timestamp_ns=0,
+            corners_2d=img_pts,
+            confidence=0.95,  # HIGH confidence
+            gate_id=0,
+        )
+        meas = solver.solve(det, gate, corners_local)
+        assert meas is not None
+        # 8 corners + high confidence → HIGH (not capped)
+        assert meas.confidence == DetectionConfidence.HIGH
 
     def test_high_confidence_capped_with_4_corners(
         self, solver: PnPSolver, camera_config: CameraConfig
     ) -> None:
         """HIGH confidence detection with only 4 model corners → capped to MEDIUM."""
         gate = _gate_at_origin()
-        corners_local = _gate_corners_local()  # 4 corners
+        corners_local = _gate_corners_local()[:4]  # outer corners only
         assert len(corners_local) == 4
 
         rvec = np.zeros(3)

@@ -10,15 +10,21 @@ num_gates = 10  # placeholder until sim provides actual count
 width_m = 1.5
 height_m = 1.5
 shape = "square"  # "square" or "rectangular"
-num_corners = 4   # outer corners; 8 if inner corners also detected
+num_corners = 8   # 4 outer + 4 inner corners
 
 # 3D corner positions relative to gate center, in gate frame
-# Ordered: top-left, top-right, bottom-right, bottom-left
+# First 4: outer corners (TL, TR, BR, BL)
+# Last 4: inner corners (TL, TR, BR, BL) — frame cutout at 65% scale
+inner_scale = 0.65
 corners_3d = [
-    [-0.75,  0.75, 0.0],
-    [ 0.75,  0.75, 0.0],
-    [ 0.75, -0.75, 0.0],
-    [-0.75, -0.75, 0.0],
+    [-0.75,    0.75,   0.0],
+    [ 0.75,    0.75,   0.0],
+    [ 0.75,   -0.75,   0.0],
+    [-0.75,   -0.75,   0.0],
+    [-0.4875,  0.4875, 0.0],
+    [ 0.4875,  0.4875, 0.0],
+    [ 0.4875, -0.4875, 0.0],
+    [-0.4875, -0.4875, 0.0],
 ]
 
 [camera]

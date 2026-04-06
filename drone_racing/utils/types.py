@@ -267,20 +267,32 @@ class GateConfig:
     width_m: float = 1.5
     height_m: float = 1.5
     shape: str = "square"
-    num_corners: int = 4
+    num_corners: int = 8
+    inner_scale: float = 0.65
     corners_3d: list[list[float]] = field(
         default_factory=lambda: [
+            # Outer corners: TL, TR, BR, BL
             [-0.75, 0.75, 0.0],
             [0.75, 0.75, 0.0],
             [0.75, -0.75, 0.0],
             [-0.75, -0.75, 0.0],
+            # Inner corners: TL, TR, BR, BL (65% scale)
+            [-0.4875, 0.4875, 0.0],
+            [0.4875, 0.4875, 0.0],
+            [0.4875, -0.4875, 0.0],
+            [-0.4875, -0.4875, 0.0],
         ]
     )
 
     @property
     def corners_3d_array(self) -> NDArray[np.floating[Any]]:
-        """Gate corner coordinates as (N, 3) numpy array."""
+        """All gate corner coordinates as (N, 3) numpy array."""
         return np.array(self.corners_3d, dtype=np.float64)
+
+    @property
+    def outer_corners_3d_array(self) -> NDArray[np.floating[Any]]:
+        """Outer 4 gate corners as (4, 3) numpy array."""
+        return np.array(self.corners_3d[:4], dtype=np.float64)
 
 
 @dataclass(slots=True)

@@ -60,7 +60,7 @@ def build_gate_circuit(config: RacingConfig) -> list[GateWaypoint]:
         Four gates forming a ~40m square circuit at 3m altitude.
     """
     gate_cfg = config.gate
-    corners_local = gate_cfg.corners_3d_array
+    corners_local = gate_cfg.outer_corners_3d_array
 
     # Gate positions: square circuit, Z=3m (above ground)
     # Drone starts near gate 0 and flies counter-clockwise
@@ -173,7 +173,11 @@ def run_pipeline(
     eskf = ESKF(mock_config)
 
     # Perception modules (only needed when use_perception=True)
-    gate_corners_3d_local = config.gate.corners_3d_array
+    # PnP uses outer 4 corners — classical detector's polygon approximation
+    # is too noisy for 8-corner PnP. The detector still returns 8 corners
+    # for confidence scoring (6+ corners → HIGH confidence in ESKF).
+    # Neural detector will use the full 8-corner model.
+    gate_corners_3d_local = config.gate.outer_corners_3d_array
     detector = ClassicalDetector(camera_config=config.camera)
     tracker = GateTracker()
     pnp = PnPSolver(config.camera, mock_est, max_reprojection_px=50.0)

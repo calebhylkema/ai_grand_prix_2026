@@ -94,7 +94,7 @@ class TestGateConfig:
     def test_corners_3d_array_shape(self) -> None:
         cfg = GateConfig()
         corners = cfg.corners_3d_array
-        assert corners.shape == (4, 3)
+        assert corners.shape == (8, 3)
 
     def test_corners_centred_at_origin(self) -> None:
         cfg = GateConfig()

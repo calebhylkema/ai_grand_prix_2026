@@ -275,14 +275,14 @@ class ClassicalDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._morph_kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel)
 
-        # --- Find contours ---
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # --- Find contours (with hierarchy for inner corner detection) ---
+        contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         # --- Filter and extract gate candidates ---
         image_area = float(image.shape[0] * image.shape[1])
         detections: list[GateDetection] = []
 
-        for contour in contours:
+        for idx, contour in enumerate(contours):
             area = cv2.contourArea(contour)
             if area < self._cfg.min_contour_area or area > self._cfg.max_contour_area:
                 continue
@@ -294,6 +294,10 @@ class ClassicalDetector:
                 continue
             aspect = max(w, h) / min(w, h)
             if aspect < self._cfg.min_aspect_ratio or aspect > self._cfg.max_aspect_ratio:
+                continue
+
+            # Skip inner (child) contours — we process them via their parent
+            if hierarchy is not None and hierarchy[0][idx][3] >= 0:
                 continue
 
             # Polygon approximation
@@ -310,12 +314,21 @@ class ClassicalDetector:
             if confidence < self._cfg.min_confidence:
                 continue
 
-            # Extract corners
-            corners = approx.reshape(-1, 2).astype(np.float64)
+            # Extract outer corners
+            outer_corners = approx.reshape(-1, 2).astype(np.float64)
+            if len(outer_corners) == 4:
+                outer_corners = _order_corners_clockwise(outer_corners)
 
-            # Order corners if exactly 4
-            if len(corners) == 4:
-                corners = _order_corners_clockwise(corners)
+            # Try to find inner corners from child contour (gate hole)
+            inner_corners = self._find_inner_corners(contours, hierarchy, idx, outer_corners)
+
+            if inner_corners is not None:
+                # Combine: 4 outer + 4 inner = 8 corners
+                corners = np.vstack([outer_corners, inner_corners])
+                # Boost confidence for 8-corner detections
+                confidence = min(1.0, confidence + 0.15)
+            else:
+                corners = outer_corners
 
             detections.append(
                 GateDetection(
@@ -325,8 +338,71 @@ class ClassicalDetector:
                 )
             )
 
-        # Sort by confidence (highest first)
-        detections.sort(key=lambda d: d.confidence, reverse=True)
+        # Sort by confidence (highest first), prefer 8-corner detections
+        detections.sort(key=lambda d: (len(d.corners_2d), d.confidence), reverse=True)
 
         logger.debug("Classical detector: found %d gate(s)", len(detections))
         return detections
+
+    def _find_inner_corners(
+        self,
+        contours: list[np.ndarray],
+        hierarchy: np.ndarray | None,
+        parent_idx: int,
+        outer_corners: np.ndarray,
+    ) -> np.ndarray | None:
+        """Extract 4 inner corners from a child contour (the gate hole).
+
+        Parameters
+        ----------
+        contours : list[np.ndarray]
+            All contours from findContours.
+        hierarchy : np.ndarray | None
+            Contour hierarchy from RETR_TREE.
+        parent_idx : int
+            Index of the outer (parent) contour.
+        outer_corners : np.ndarray
+            (4, 2) ordered outer corners for validation.
+
+        Returns
+        -------
+        np.ndarray | None
+            (4, 2) ordered inner corners, or None if not found.
+        """
+        if hierarchy is None:
+            return None
+
+        # Find the first child contour
+        child_idx = hierarchy[0][parent_idx][2]
+        if child_idx < 0:
+            return None
+
+        child = contours[child_idx]
+        child_area = cv2.contourArea(child)
+        parent_area = cv2.contourArea(contours[parent_idx])
+
+        # Inner hole should be 30-80% of the outer area
+        if parent_area < 1:
+            return None
+        area_ratio = child_area / parent_area
+        if area_ratio < 0.2 or area_ratio > 0.85:
+            return None
+
+        # Approximate child to polygon
+        perimeter = cv2.arcLength(child, closed=True)
+        epsilon = self._cfg.approx_epsilon_factor * perimeter
+        approx = cv2.approxPolyDP(child, epsilon, closed=True)
+
+        if len(approx) != 4:
+            return None
+
+        inner = approx.reshape(-1, 2).astype(np.float64)
+        inner = _order_corners_clockwise(inner)
+
+        # Validate: inner centroid should be close to outer centroid
+        outer_c = outer_corners.mean(axis=0)
+        inner_c = inner.mean(axis=0)
+        if np.linalg.norm(outer_c - inner_c) > 50.0:
+            return None
+
+        return inner

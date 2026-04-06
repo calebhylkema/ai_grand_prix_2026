@@ -173,6 +173,78 @@ class PnPSolver:
 
         return reordered
 
+    def _solve_pnp_ippe_best(
+        self,
+        obj_pts: np.ndarray,
+        img_pts: np.ndarray,
+        drone_state: State,
+        gate: GateWaypoint,
+    ) -> tuple[bool, np.ndarray, np.ndarray]:
+        """Solve PnP with IPPE and pick the solution closest to the ESKF state.
+
+        IPPE (Infinitesimal Plane-based Pose Estimation) is designed for
+        coplanar points and returns up to 2 solutions.  We pick the one
+        whose implied drone position is closest to the current ESKF estimate.
+
+        Parameters
+        ----------
+        obj_pts : np.ndarray
+            (N, 3) 3D object points in gate-local frame.
+        img_pts : np.ndarray
+            (N, 2) detected 2D image points.
+        drone_state : State
+            Current ESKF state estimate for disambiguation.
+        gate : GateWaypoint
+            Gate pose in world frame.
+
+        Returns
+        -------
+        tuple[bool, np.ndarray, np.ndarray]
+            (success, rvec, tvec) best solution.
+        """
+        try:
+            n_solutions, rvecs, tvecs, reproj_errors = cv2.solvePnPGeneric(
+                obj_pts,
+                img_pts,
+                self._camera_k,
+                self._camera_dist,
+                flags=cv2.SOLVEPNP_IPPE,
+            )
+        except cv2.error:
+            return False, np.zeros(3), np.zeros(3)
+
+        if n_solutions == 0:
+            return False, np.zeros(3), np.zeros(3)
+
+        # Score each solution by distance from ESKF estimate
+        best_rvec = rvecs[0]
+        best_tvec = tvecs[0]
+        best_dist = float("inf")
+
+        try:
+            t_wg = pose_to_matrix(gate.position_w, gate.orientation_w)
+
+            for i in range(n_solutions):
+                rv = rvecs[i]
+                tv = tvecs[i]
+                r_cg, _ = cv2.Rodrigues(rv)
+                t_cg = np.eye(4, dtype=np.float64)
+                t_cg[:3, :3] = r_cg
+                t_cg[:3, 3] = tv.flatten()
+                t_gc = invert_transform(t_cg)
+                t_wc = t_wg @ t_gc
+                t_wb = t_wc @ self._t_cb
+                pos_w = t_wb[:3, 3]
+                dist = float(np.linalg.norm(pos_w - drone_state.position))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_rvec = rv
+                    best_tvec = tv
+        except (np.linalg.LinAlgError, ValueError):
+            return False, np.zeros(3), np.zeros(3)
+
+        return True, best_rvec, best_tvec
+
     def solve(
         self,
         detection: GateDetection,
@@ -214,29 +286,48 @@ class PnPSolver:
 
         img_pts = corners_2d[:n_use].astype(np.float64)
 
-        # --- Corner matching + PnP with initial guess ---
+        # --- Corner matching + PnP ---
         if drone_state is not None:
             rvec_guess, tvec_guess = self._compute_approximate_t_cg(drone_state, gate)
 
-            # Reorder 3D corners to match detected 2D ordering
-            obj_pts = self._match_corners(
-                gate_corners_3d_local[:n_use],
-                img_pts,
-                rvec_guess,
-                tvec_guess,
-            )
+            # Match 2D→3D corner ordering. For 8 corners, match outer and
+            # inner rings separately to prevent cross-assignment.
+            if n_use <= 4:
+                obj_pts = self._match_corners(
+                    gate_corners_3d_local[:n_use],
+                    img_pts,
+                    rvec_guess,
+                    tvec_guess,
+                )
+            else:
+                # Match outer 4 and inner 4 independently
+                outer_3d = self._match_corners(
+                    gate_corners_3d_local[:4], img_pts[:4], rvec_guess, tvec_guess
+                )
+                inner_3d = self._match_corners(
+                    gate_corners_3d_local[4:n_use],
+                    img_pts[4:n_use],
+                    rvec_guess,
+                    tvec_guess,
+                )
+                obj_pts = np.vstack([outer_3d, inner_3d])
 
-            # Solve PnP with initial guess to resolve coplanar ambiguity
-            success, rvec, tvec = cv2.solvePnP(
-                obj_pts,
-                img_pts,
-                self._camera_k,
-                self._camera_dist,
-                rvec=rvec_guess.copy(),
-                tvec=tvec_guess.copy(),
-                useExtrinsicGuess=True,
-                flags=cv2.SOLVEPNP_ITERATIVE,
-            )
+            if n_use >= 6:
+                # 6+ corners: use IPPE (coplanar solver) which returns both
+                # solutions, then pick the one closest to our ESKF estimate.
+                success, rvec, tvec = self._solve_pnp_ippe_best(obj_pts, img_pts, drone_state, gate)
+            else:
+                # 4 corners: ITERATIVE with extrinsic guess
+                success, rvec, tvec = cv2.solvePnP(
+                    obj_pts,
+                    img_pts,
+                    self._camera_k,
+                    self._camera_dist,
+                    rvec=rvec_guess.copy(),
+                    tvec=tvec_guess.copy(),
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
         else:
             obj_pts = gate_corners_3d_local[:n_use].astype(np.float64)
             success, rvec, tvec = cv2.solvePnP(
@@ -307,7 +398,11 @@ class PnPSolver:
         t_wb = t_wc @ self._t_cb
 
         # Extract position and orientation
-        position_w, orientation_w = matrix_to_pose(t_wb)
+        try:
+            position_w, orientation_w = matrix_to_pose(t_wb)
+        except np.linalg.LinAlgError:
+            logger.debug("PnP: degenerate rotation for gate %s — skipping", gate.gate_id)
+            return None
 
         # Sanity check: PnP position should be close to current ESKF estimate.
         # Use a generous threshold — the filter itself handles outliers via chi².
@@ -327,13 +422,14 @@ class PnPSolver:
         pos_noise = self._est_cfg.pnp_position_noise_std * distance_factor
         ori_noise = self._est_cfg.pnp_orientation_noise_std * distance_factor
 
-        # Cap confidence at MEDIUM when using only 4 model corners.
-        # Full 6-DOF corrections require reliable orientation data, which
-        # needs more than 4 coplanar points (PnP orientation is ambiguous).
+        # Cap confidence at MEDIUM when the detection has only 4 corners.
+        # Full 6-DOF corrections require reliable orientation data.  With
+        # 8 detected corners (even if PnP only uses 4 model corners),
+        # the detection is reliable enough for HIGH confidence.
         from drone_racing.utils.types import DetectionConfidence
 
         confidence = detection.confidence_level
-        if n_use <= 4 and confidence == DetectionConfidence.HIGH:
+        if n_corners <= 4 and confidence == DetectionConfidence.HIGH:
             confidence = DetectionConfidence.MEDIUM
 
         return PoseMeasurement(
