@@ -28,15 +28,20 @@ Each loop runs at progressively higher frequency for stability.
 
 ## Output Interface
 
-The simulator expects commands in this format (from competition docs):
+The simulator receives commands via MAVLink `SET_ATTITUDE_TARGET` (VADR-TS-001).
+Our `DroneCommand` maps to MAVSDK's `AttitudeRate`:
+
 ```python
 @dataclass
 class DroneCommand:
-    throttle: float   # 0.0 to 1.0 (normalized thrust)
-    roll: float       # rad/s (angular rate command)
-    pitch: float      # rad/s (angular rate command)
-    yaw: float        # rad/s (angular rate command)
+    throttle: float     # 0.0 to 1.0 (normalized thrust) → thrust_value
+    roll_rate: float    # rad/s → roll_deg_s (converted at boundary)
+    pitch_rate: float   # rad/s → pitch_deg_s (converted at boundary)
+    yaw_rate: float     # rad/s → yaw_deg_s (converted at boundary)
 ```
+
+Conversion to MAVSDK: `mavsdk_adapter.py` converts rad/s → deg/s at the boundary.
+Alternative: `SET_POSITION_TARGET_LOCAL_NED` for position/velocity control (NED frame).
 
 ## Safety Constraints
 

@@ -10,12 +10,12 @@
 
 The Anduril AI Grand Prix 2026 is a $500K autonomous drone racing competition. All teams get identical hardware (Neros Technologies drones with DCL AI vector module). Software is the only differentiator. Python is the primary language. Over 1,000 teams registered within 24 hours of announcement on January 27, 2026.
 
-### Timeline
-- **March 2026 (second half):** Interface specifications released
-- **May 2026:** Simulator + SDK released, Virtual Qualifier 1 opens
-- **May–July 2026:** Virtual qualifying rounds (VQ1 then VQ2)
-- **September 2026 (SoCal):** 2-week physical qualifier with real drones
-- **November 2026 (Columbus, OH):** Championship finals at Anduril Arsenal-1
+### Timeline (CONFIRMED — official spec + email April 2026)
+- **March 2026:** Interface spec released (VADR-TS-001)
+- **May 2026:** VQ1 launches (open through end of VQ2). Sim provided as downloadable package.
+- **June 2026:** VQ2 launches (open until mid-late July)
+- **September 2026 (California):** Physical qualifier with real drones (no audience)
+- **November 2026 (Ohio):** Grand Prix Finals, head-to-head with audience
 
 ### Prizes
 - $500K total prize pool, top 10 guaranteed ≥$5K each
@@ -23,29 +23,34 @@ The Anduril AI Grand Prix 2026 is a $500K autonomous drone racing competition. A
 - If winner declines: each team member gets extra $10K (up to $80K for 8-person team)
 - Top university performers screened for Anduril internships
 
-### Hardware Platform
+### Hardware Platform (physical stage)
 - Identical drones built by Neros Technologies
 - ~100 TOPS onboard compute (likely NVIDIA Jetson Orin NX class)
-- Single ~12MP wide-angle FPV camera (forward-facing)
+- Forward-facing FPV camera (resolution/intrinsics shared before physical stage)
 - 6-axis IMU (gyroscope + accelerometer)
 - NO LiDAR, NO GPS, NO stereo vision, NO depth sensor, NO external positioning
 
-### Simulator Provides
-- Forward-facing RGB visual stream
-- Telemetry: starting position, velocity, orientation
-- Control interface: throttle, roll, pitch, yaw
-- Python API (Python 3.14.2 confirmed working)
-- External libraries allowed, compiled extensions (C/Cython) expected to be permitted
+### Simulator Interface (CONFIRMED — VADR-TS-001)
+- **Communication:** MAVLink v2 over UDP via MAVSDK-compatible interfaces
+- **Telemetry (Sim → Client):** HEARTBEAT, ATTITUDE, HIGHRES_IMU, ODOMETRY, TIMESYNC
+- **Control (Client → Sim):** SET_ATTITUDE_TARGET, SET_POSITION_TARGET_LOCAL_NED
+- **Telemetry data:** attitude, orientation, linear velocities, system status flags, nav reference data
+- **Vision:** Forward-facing FPV stream (parameters in separate spec, TBD)
+- **Physics:** 120 Hz update, rigid-body flight model (thrust, drag, gravity, collision)
+- **Timing:** Command rate 50–120 Hz recommended, heartbeat min 2 Hz
+- **Runtime:** Python 3.14.2 confirmed. Any language/framework allowed.
+- **Platform:** Windows only (Linux not working). Downloadable, runs locally, internet required (anti-cheat).
+- Can run multiple sim instances in parallel.
+- Local Cartesian coordinate system. No GPS, no absolute global position.
 
 ### Simulator Does NOT Provide
 - No depth information
-- No engine RPM data
-- No battery SoC
-- No manual steering (even for training)
+- No GPS or absolute positioning
+- No additional sensor shortcuts
 
-### Virtual Qualifier Structure
-- **VQ1:** Desaturated environment, highlighted gates, high SNR, visual aids possibly active
-- **VQ2:** Photorealistic environment, lighting distractions, lower SNR, visual aids OFF
+### Virtual Qualifier Structure (CONFIRMED — official spec + email)
+- **VQ1:** < 10 gates, minimal distractions, clear gate visibility, full 3D with elevation changes. Focus on completion. Unlimited attempts, 8 min max. Gates consistent within round. Non-gated objects may be present.
+- **VQ2:** < 20 gates, increased complexity (lighting changes, 3D objects, obstacles). Fastest valid time counts. Gate positions change from VQ1.
 
 ### Key URLs
 - Official site: https://theaigrandprix.com/

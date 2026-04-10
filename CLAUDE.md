@@ -8,13 +8,15 @@ Python-only autonomy stack for the Anduril AI Grand Prix 2026 ($500K autonomous 
 
 ## Critical Constraints
 
-- Python 3.12+ (competition confirmed 3.14.2 works). C/Cython extensions permitted.
-- Single forward-facing ~12MP wide-angle FPV camera
-- 6-axis IMU (gyro + accel) — may saturate above ~16g
-- ~100 TOPS onboard compute (likely NVIDIA Jetson Orin NX class)
-- Telemetry provides: starting position, velocity, orientation
-- Controls: throttle, roll, pitch, yaw (rate commands)
-- NO depth, NO engine RPM, NO battery SoC, NO manual steering
+- Python 3.12+ (competition confirmed 3.14.2 works). C/Cython extensions permitted. Any language allowed.
+- Single forward-facing FPV camera (resolution/FPS TBD — separate vision spec coming)
+- 6-axis IMU (gyro + accel) via HIGHRES_IMU MAVLink message
+- Telemetry: attitude, orientation, linear velocities, system status, nav reference data
+- Controls: throttle, roll, pitch, yaw via SET_ATTITUDE_TARGET MAVLink message
+- Communication: MAVLink v2 over UDP via MAVSDK. Command rate 50–120 Hz, heartbeat min 2 Hz.
+- Sim runs locally on **Windows only**, requires internet (anti-cheat)
+- ~100 TOPS onboard compute (likely NVIDIA Jetson Orin NX class) — physical stage only
+- NO depth, NO GPS, NO absolute position, NO manual steering
 
 ## Repository Layout
 
@@ -24,7 +26,7 @@ drone_racing/          # Main package
   estimation/          # ESKF: IMU propagation + vision corrections
   planning/            # MPCC racing line + receding horizon
   control/             # RL policy, PID fallback, safety ladder
-  sim/                 # Simulator adapter (DCL API interface)
+  sim/                 # Simulator adapter (MAVLink/MAVSDK interface)
   logging/             # Flight telemetry recording
   utils/               # Coordinate transforms, math helpers
 config/                # TOML scenario configs
@@ -75,16 +77,17 @@ uv run python scripts/train_policy.py   # Train RL policy
 
 ## Coordinate Frames
 
-- **World frame (W):** Right-handed, Z-up, origin at race start
-- **Body frame (B):** FRD (Front-Right-Down), origin at drone center of mass
+- **Sim frame:** Local Cartesian (no geographic coords). Convention TBD — MAVLink uses NED but spec says "local Cartesian" without specifying. Clarification pending from organizers.
+- **Body frame (B):** FRD (Front-Right-Down), origin at drone center of mass (MAVLink convention)
 - **Camera frame (C):** OpenCV convention (X-right, Y-down, Z-forward)
 - All rotations stored as quaternions (scalar-last: [x, y, z, w]) unless interfacing with scipy (scalar-first)
 - Gate poses stored as [x, y, z, qx, qy, qz, qw] in world frame
+- **NOTE:** SET_POSITION_TARGET_LOCAL_NED uses NED. Our internal Z-up convention will need a conversion layer at the MAVSDK boundary.
 
 ## Competition Phases
 
-1. **VQ1 (May–June 2026):** Desaturated environment, highlighted gates, high SNR — classical CV viable
-2. **VQ2 (June–July 2026):** Photorealistic, lighting distractions, visual aids OFF — need learned detectors
+1. **VQ1 (May 2026, open through VQ2):** < 10 gates, minimal distractions, clear gate visibility, full 3D with elevation changes. Focus on **completion**. Unlimited attempts, 8 min max per run.
+2. **VQ2 (June–mid/late July 2026):** < 20 gates, increased complexity (lighting changes, 3D objects, obstacles). Fastest valid time counts.
 3. **Physical Qualifier (Sept 2026, SoCal):** Real Neros drone, sim-to-real gap is the challenge
 4. **Finals (Nov 2026, Columbus OH):** Head-to-head racing, reliability wins
 

@@ -23,6 +23,102 @@ if TYPE_CHECKING:
 # Gravity in world frame (Z-up, g ≈ 9.81 m/s² downward)
 GRAVITY_W: Vec3 = np.array([0.0, 0.0, -9.81], dtype=np.float64)
 
+# ---------------------------------------------------------------------------
+# NED ↔ ENU (Z-up) conversions
+# ---------------------------------------------------------------------------
+# MAVLink uses NED (North-East-Down).  Our internal world frame is ENU-like
+# (X-East, Y-North, Z-Up) — or more precisely, a local Z-up Cartesian frame.
+# The sim spec says "local Cartesian" without specifying NED vs ENU, but
+# SET_POSITION_TARGET_LOCAL_NED explicitly uses NED, so we need conversions
+# at the MAVSDK boundary.
+#
+# NED → ENU:  x_enu =  y_ned,  y_enu =  x_ned,  z_enu = -z_ned
+# ENU → NED:  x_ned =  y_enu,  y_ned =  x_enu,  z_ned = -z_enu
+# ---------------------------------------------------------------------------
+
+
+def ned_to_enu(v_ned: Vec3) -> Vec3:
+    """Convert a 3-vector from NED to ENU (Z-up) frame.
+
+    Parameters
+    ----------
+    v_ned : Vec3
+        Vector in NED frame [north, east, down].
+
+    Returns
+    -------
+    Vec3
+        Vector in ENU frame [east, north, up].
+    """
+    return np.array([v_ned[1], v_ned[0], -v_ned[2]], dtype=np.float64)
+
+
+def enu_to_ned(v_enu: Vec3) -> Vec3:
+    """Convert a 3-vector from ENU (Z-up) to NED frame.
+
+    Parameters
+    ----------
+    v_enu : Vec3
+        Vector in ENU frame [east, north, up].
+
+    Returns
+    -------
+    Vec3
+        Vector in NED frame [north, east, down].
+    """
+    return np.array([v_enu[1], v_enu[0], -v_enu[2]], dtype=np.float64)
+
+
+def quat_ned_to_enu(q_ned: Vec4) -> Vec4:
+    """Convert a quaternion from NED body convention to ENU body convention.
+
+    NED body: FRD (Front-Right-Down).
+    ENU body: FLU (Front-Left-Up) — but we use FRD internally, so this
+    accounts for the world-frame rotation only.
+
+    The rotation between NED and ENU world frames is 90° about Z then
+    180° about the new X, but for our pipeline the simplest correct
+    approach is: rotate the attitude by the NED→ENU frame transform.
+
+    Parameters
+    ----------
+    q_ned : Vec4
+        Quaternion [x, y, z, w] in NED convention.
+
+    Returns
+    -------
+    Vec4
+        Quaternion [x, y, z, w] in ENU convention.
+    """
+    # NED→ENU frame rotation: swap x↔y, negate z
+    # R_enu_ned = [[0,1,0],[1,0,0],[0,0,-1]]
+    r_enu_ned = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
+    q_frame = Rotation.from_matrix(r_enu_ned).as_quat()
+    r_body = Rotation.from_quat(q_ned)
+    r_enu = Rotation.from_quat(q_frame) * r_body
+    return r_enu.as_quat().astype(np.float64)
+
+
+def quat_enu_to_ned(q_enu: Vec4) -> Vec4:
+    """Convert a quaternion from ENU body convention to NED body convention.
+
+    Parameters
+    ----------
+    q_enu : Vec4
+        Quaternion [x, y, z, w] in ENU convention.
+
+    Returns
+    -------
+    Vec4
+        Quaternion [x, y, z, w] in NED convention.
+    """
+    # ENU→NED is the same rotation matrix (it's its own inverse)
+    r_ned_enu = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
+    q_frame = Rotation.from_matrix(r_ned_enu).as_quat()
+    r_body = Rotation.from_quat(q_enu)
+    r_ned = Rotation.from_quat(q_frame) * r_body
+    return r_ned.as_quat().astype(np.float64)
+
 
 # ---------------------------------------------------------------------------
 # Quaternion helpers

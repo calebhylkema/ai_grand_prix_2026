@@ -82,6 +82,14 @@ spline_smoothing = 0.5
 gate_approach_offset_m = 2.0  # waypoint distance before/after each gate
 max_velocity_mps = 25.0       # conservative starting limit
 
+[mavlink]
+# MAVSDK connection parameters (for real simulator)
+system_address = "udp://:14540"     # UDP endpoint for MAVLink
+command_rate_hz = 50.0              # Attitude command send rate (spec: 50–120 Hz)
+heartbeat_rate_hz = 2.0             # Minimum heartbeat rate (spec: 2 Hz minimum)
+coordinate_frame = "ned"            # MAVLink uses NED internally
+offboard_mode = "attitude_rate"     # "attitude_rate" or "position"
+
 [perception]
 # Detector selection: "classical" or "neural"
 backend = "classical"

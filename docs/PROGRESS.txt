@@ -1,8 +1,8 @@
 # AI Grand Prix — Progress Tracker
 
-**Last Updated:** 2026-04-04
-**Current Phase:** Phase 0 — Foundation
-**Current Step:** Step 7 — Integration (vision corrections working)
+**Last Updated:** 2026-04-10
+**Current Phase:** Phase 0 → Phase 1 transition
+**Current Step:** Official spec received (VADR-TS-001). MAVSDK integration is #1 priority.
 
 ---
 
@@ -100,10 +100,12 @@
 
 ---
 
-## Phase 1: VQ1 (May–June 2026)
-- [ ] Simulator adapter for real DCL API
+## Phase 1: VQ1 (May 2026, open through end of VQ2)
+- [ ] MAVSDK integration layer (MAVLink v2 over UDP) — #1 PRIORITY
+- [ ] Vision stream capture/decode (waiting on separate vision spec)
+- [ ] Control → SET_ATTITUDE_TARGET mapping
 - [ ] Classical detector tuned for VQ1 environment
-- [ ] Complete full course without crashing
+- [ ] Complete full course without crashing (< 10 gates, 8 min max)
 - [ ] Submit qualifying run
 
 ## Phase 2: VQ2 (June–July 2026)

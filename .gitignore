@@ -23,6 +23,7 @@ venv/
 .coverage
 htmlcov/
 .pytest_cache/
+.hypothesis/
 
 # Logs and data
 logs/
@@ -36,6 +37,8 @@ runs/
 models/*.onnx
 models/*.pt
 models/*.pth
+*.pt
+*.onnx
 
 # Docker
 .docker/

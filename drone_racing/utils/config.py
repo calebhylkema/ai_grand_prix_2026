@@ -20,6 +20,7 @@ from drone_racing.utils.types import (
     ControlConfig,
     EstimationConfig,
     GateConfig,
+    MAVLinkConfig,
     PlannerConfig,
 )
 
@@ -35,6 +36,7 @@ class RacingConfig:
     gate: GateConfig = field(default_factory=GateConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
+    mavlink: MAVLinkConfig = field(default_factory=MAVLinkConfig)
     raw: dict[str, object] = field(default_factory=dict, repr=False)
     """The full parsed TOML dict, for sections not yet modelled."""
 
@@ -71,12 +73,14 @@ def load_config(path: str | Path | None = None) -> RacingConfig:
 
     control_raw = raw.get("control", {})
     planner_raw = raw.get("planner", {})
+    mavlink_raw = raw.get("mavlink", {})
 
     estimation = EstimationConfig(**estimation_raw)
     camera = CameraConfig(**camera_raw)
     gate = GateConfig(**gate_raw)
     control = ControlConfig(**control_raw)
     planner = PlannerConfig(**planner_raw)
+    mavlink = MAVLinkConfig(**mavlink_raw)
 
     return RacingConfig(
         estimation=estimation,
@@ -84,5 +88,6 @@ def load_config(path: str | Path | None = None) -> RacingConfig:
         gate=gate,
         control=control,
         planner=planner,
+        mavlink=mavlink,
         raw=raw,
     )

@@ -26,40 +26,52 @@ Build the fastest, most reliable autonomous drone racing stack for the Anduril A
 - [ ] `docs/adr/0001-eskf-over-ekf.md` — first architecture decision record
 
 ### Risk Mitigation
-- Interface specs due "second half of March" — design adapter pattern now so sim integration is a thin layer
+- Interface specs RECEIVED (VADR-TS-001, March 2026) — MAVLink v2 over UDP via MAVSDK confirmed
 - Train YOLOv8-nano on synthetic gate images before real sim data exists
+- Gate dimensions/color still TBD — don't hardcode, read from config
 
 ---
 
-## Phase 1: VQ1 — Virtual Qualifier Round 1 (May–June 2026)
+## Phase 1: VQ1 — Virtual Qualifier Round 1 (May 2026, open through end of VQ2)
 
-### Environment
-- Desaturated visuals, highlighted gates, high SNR
-- Visual aids possibly active
+### Environment (CONFIRMED — official spec)
+- < 10 gates, full 3D with elevation changes
+- Minimal distractions, clear gate visibility
+- Gates visually distinctive from environment, consistent style
+- Non-gated objects may be present
+- Start and finish gate may differ slightly from intermediates
+- Deterministic: same course, physics, and environment for all teams
+- 8 minutes max per attempt, unlimited attempts
+- **Focus on completion, not speed**
 
 ### Strategy
 Classical CV is likely sufficient here. Focus on **reliability over speed**.
+MAVSDK integration is the #1 blocker — must be built before sim drops.
 
 ### Deliverables
-- [ ] Simulator adapter (`drone_racing/sim/dcl_adapter.py`) wrapping competition API
+- [ ] MAVSDK integration layer (`drone_racing/sim/`) — UDP connection, heartbeat, telemetry parsing, command sending
+- [ ] Vision stream capture/decode (format TBD, waiting on separate vision spec)
+- [ ] Control → SET_ATTITUDE_TARGET mapping
 - [ ] Classical detector tuned for VQ1 environment
-- [ ] Full pipeline running: camera → detect → PnP → ESKF → plan → control → commands
-- [ ] Complete at least one full lap without crashing
+- [ ] Full pipeline running: camera → detect → PnP → ESKF → plan → control → MAVLink commands
+- [ ] Complete at least one full course without crashing
 - [ ] Latency profiling: target <40ms end-to-end
 - [ ] Flight data logger recording full telemetry for replay
 
 ### Success Criteria
-- **Minimum:** Complete the course. Any time counts.
-- **Target:** Top 50% of qualifying times.
+- **Minimum:** Complete the course. Any time counts (VQ1 is pass/fail on completion).
+- **Target:** Top 50% of completing teams.
 - **Stretch:** Top 20%.
 
 ---
 
-## Phase 2: VQ2 — Virtual Qualifier Round 2 (June–July 2026)
+## Phase 2: VQ2 — Virtual Qualifier Round 2 (June–mid/late July 2026)
 
-### Environment
-- Photorealistic, lighting distractions, lower SNR
-- Visual aids OFF — gates blend into environment
+### Environment (CONFIRMED — official spec)
+- < 20 gates, increased complexity
+- Lighting changes, 3D objects, obstacles
+- Gates change positions from VQ1 but remain consistent within VQ2
+- Fastest valid time counts
 
 ### Strategy
 Switch to neural gate detection. This is where the competition gets real.
@@ -151,7 +163,7 @@ Head-to-head racing — consistency matters even more.
 
 | Date | Decision | Options |
 |------|----------|---------|
-| March 2026 | Interface specs released | Adapt adapter layer |
+| March 2026 | Interface specs released | **DONE** — MAVLink v2/MAVSDK confirmed, MAVSDK integration is #1 priority |
 | May 2026 | Sim available | Validate all assumptions |
 | June 2026 | VQ1 results | Classical CV sufficient or need neural for VQ1? |
 | July 2026 | VQ2 results | MPCC vs RL as primary controller |

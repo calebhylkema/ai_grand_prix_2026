@@ -12,6 +12,8 @@ dependencies = [
     "opencv-python-headless>=4.9",
     "pydantic>=2.5",
     "tomli>=2.0; python_version < '3.11'",
+    "ultralytics>=8.4.21",
+    "mavsdk>=3.15.3",
 ]
 
 [project.optional-dependencies]
@@ -88,3 +90,8 @@ omit = ["drone_racing/logging/*"]
 
 [tool.coverage.report]
 fail_under = 80
+
+[dependency-groups]
+dev = [
+    "pymupdf>=1.27.2.2",
+]
