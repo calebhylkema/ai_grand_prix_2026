@@ -102,6 +102,34 @@ class TelemetrySnapshot:
     armed: bool = False
     offboard_active: bool = False
 
+    # Staleness tracking
+    last_attitude_ns: int = 0
+    """Monotonic timestamp of the last ATTITUDE update."""
+    last_imu_ns: int = 0
+    """Monotonic timestamp of the last IMU update."""
+    last_odometry_ns: int = 0
+    """Monotonic timestamp of the last ODOMETRY update."""
+
+
+_TELEMETRY_STALE_NS: int = 500_000_000
+"""Telemetry older than 500 ms is considered stale."""
+
+_MAX_RECONNECT_ATTEMPTS: int = 5
+"""Maximum reconnection attempts before giving up."""
+
+_RECONNECT_DELAY_S: float = 2.0
+"""Delay between reconnection attempts (seconds)."""
+
+
+def _is_finite_vec(v: np.ndarray) -> bool:
+    """Return True if every element is finite (not NaN or Inf)."""
+    return bool(np.all(np.isfinite(v)))
+
+
+def _is_finite_scalar(*values: float) -> bool:
+    """Return True if all scalar values are finite."""
+    return all(math.isfinite(v) for v in values)
+
 
 class MAVSDKAdapter:
     """Adapter between our pipeline and the AI Grand Prix simulator via MAVSDK.
@@ -123,6 +151,8 @@ class MAVSDKAdapter:
         self._command_period = 1.0 / config.command_rate_hz
         self._start_time_ns: int = 0
         self._tasks: list[asyncio.Task[None]] = []
+        self._nan_count: int = 0
+        self._reconnecting: bool = False
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -215,6 +245,44 @@ class MAVSDKAdapter:
         self._running = False
         logger.info("MAVSDKAdapter stopped.")
 
+    async def reconnect(self) -> bool:
+        """Attempt to reconnect after a connection loss.
+
+        Returns
+        -------
+        bool
+            True if reconnection succeeded.
+        """
+        if self._reconnecting:
+            return False
+        self._reconnecting = True
+        logger.warning("Connection lost — attempting reconnect...")
+
+        # Clean up existing tasks
+        for task in self._tasks:
+            task.cancel()
+        self._tasks.clear()
+        self._telemetry.connected = False
+        self._telemetry.offboard_active = False
+
+        for attempt in range(1, _MAX_RECONNECT_ATTEMPTS + 1):
+            try:
+                logger.info("Reconnect attempt %d/%d", attempt, _MAX_RECONNECT_ATTEMPTS)
+                await self.connect()
+                await self.start_offboard()
+                logger.info("Reconnected successfully on attempt %d", attempt)
+                self._reconnecting = False
+                return True
+            except Exception:
+                logger.exception("Reconnect attempt %d failed", attempt)
+                if attempt < _MAX_RECONNECT_ATTEMPTS:
+                    await asyncio.sleep(_RECONNECT_DELAY_S)
+
+        logger.error("Failed to reconnect after %d attempts", _MAX_RECONNECT_ATTEMPTS)
+        self._running = False
+        self._reconnecting = False
+        return False
+
     # ------------------------------------------------------------------
     # Public API — data access
     # ------------------------------------------------------------------
@@ -222,6 +290,29 @@ class MAVSDKAdapter:
     def is_running(self) -> bool:
         """Whether the adapter is connected and offboard mode is active."""
         return self._running and self._telemetry.connected
+
+    def is_imu_stale(self) -> bool:
+        """Return True if IMU data is older than the staleness threshold."""
+        if self._telemetry.last_imu_ns == 0:
+            return True
+        return (time.monotonic_ns() - self._telemetry.last_imu_ns) > _TELEMETRY_STALE_NS
+
+    def is_attitude_stale(self) -> bool:
+        """Return True if attitude data is older than the staleness threshold."""
+        if self._telemetry.last_attitude_ns == 0:
+            return True
+        return (time.monotonic_ns() - self._telemetry.last_attitude_ns) > _TELEMETRY_STALE_NS
+
+    def is_odometry_stale(self) -> bool:
+        """Return True if odometry data is older than the staleness threshold."""
+        if not self._telemetry.odometry_valid:
+            return True
+        return (time.monotonic_ns() - self._telemetry.last_odometry_ns) > _TELEMETRY_STALE_NS
+
+    @property
+    def nan_count(self) -> int:
+        """Number of NaN/Inf telemetry samples dropped since startup."""
+        return self._nan_count
 
     @property
     def telemetry(self) -> TelemetrySnapshot:
@@ -325,6 +416,20 @@ class MAVSDKAdapter:
         if self._system is None or not self._telemetry.offboard_active:
             return
 
+        # Validate command values before sending
+        if not _is_finite_scalar(cmd.throttle, cmd.roll_rate, cmd.pitch_rate, cmd.yaw_rate):
+            logger.warning("Command contains NaN/Inf — refusing to send")
+            return
+        if not 0.0 <= cmd.throttle <= 1.0:
+            logger.warning("Throttle %.2f out of [0,1] — clamping", cmd.throttle)
+            cmd = DroneCommand(
+                timestamp_ns=cmd.timestamp_ns,
+                throttle=max(0.0, min(1.0, cmd.throttle)),
+                roll_rate=cmd.roll_rate,
+                pitch_rate=cmd.pitch_rate,
+                yaw_rate=cmd.yaw_rate,
+            )
+
         system = self._system
 
         if self._cfg.offboard_mode == "attitude_rate":
@@ -384,11 +489,21 @@ class MAVSDKAdapter:
         """Subscribe to ATTITUDE messages and update telemetry snapshot."""
         try:
             async for attitude in system.telemetry.attitude_euler():
+                roll = attitude.roll_deg
+                pitch = attitude.pitch_deg
+                yaw = attitude.yaw_deg
+                if not _is_finite_scalar(roll, pitch, yaw):
+                    self._nan_count += 1
+                    logger.warning("ATTITUDE contains NaN/Inf — dropping sample")
+                    continue
+
                 t = self._telemetry
-                t.attitude_roll = math.radians(attitude.roll_deg)
-                t.attitude_pitch = math.radians(attitude.pitch_deg)
-                t.attitude_yaw = math.radians(attitude.yaw_deg)
-                t.timestamp_ns = time.monotonic_ns()
+                t.attitude_roll = math.radians(roll)
+                t.attitude_pitch = math.radians(pitch)
+                t.attitude_yaw = math.radians(yaw)
+                now = time.monotonic_ns()
+                t.timestamp_ns = now
+                t.last_attitude_ns = now
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -398,19 +513,27 @@ class MAVSDKAdapter:
         """Subscribe to HIGHRES_IMU messages and update telemetry snapshot."""
         try:
             async for imu in system.telemetry.imu():
-                t = self._telemetry
-                # MAVSDK IMU: acceleration_frd (m/s^2), angular_velocity_frd (rad/s)
                 acc = imu.acceleration_frd
                 gyro = imu.angular_velocity_frd
-                t.imu_accel = np.array(
+                accel_vec = np.array(
                     [acc.forward_m_s2, acc.right_m_s2, acc.down_m_s2],
                     dtype=np.float64,
                 )
-                t.imu_gyro = np.array(
+                gyro_vec = np.array(
                     [gyro.forward_rad_s, gyro.right_rad_s, gyro.down_rad_s],
                     dtype=np.float64,
                 )
-                t.imu_timestamp_ns = time.monotonic_ns()
+                if not (_is_finite_vec(accel_vec) and _is_finite_vec(gyro_vec)):
+                    self._nan_count += 1
+                    logger.warning("IMU contains NaN/Inf — dropping sample")
+                    continue
+
+                t = self._telemetry
+                t.imu_accel = accel_vec
+                t.imu_gyro = gyro_vec
+                now = time.monotonic_ns()
+                t.imu_timestamp_ns = now
+                t.last_imu_ns = now
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -428,15 +551,11 @@ class MAVSDKAdapter:
         """
         try:
             async for odom in system.telemetry.odometry():
-                t = self._telemetry
                 # Position: NED → ENU
                 pos_ned = np.array(
                     [odom.position_body.x_m, odom.position_body.y_m, odom.position_body.z_m],
                     dtype=np.float64,
                 )
-                t.odometry_position = ned_to_enu(pos_ned)
-
-                # Velocity: NED → ENU
                 vel_ned = np.array(
                     [
                         odom.velocity_body.x_m_s,
@@ -445,17 +564,34 @@ class MAVSDKAdapter:
                     ],
                     dtype=np.float64,
                 )
-                t.odometry_velocity = ned_to_enu(vel_ned)
-
-                # Orientation: quaternion NED → ENU
                 q_ned = np.array(
                     [odom.q.x, odom.q.y, odom.q.z, odom.q.w],
                     dtype=np.float64,
                 )
-                t.odometry_orientation = quat_ned_to_enu(q_ned)
+
+                if not (
+                    _is_finite_vec(pos_ned) and _is_finite_vec(vel_ned) and _is_finite_vec(q_ned)
+                ):
+                    self._nan_count += 1
+                    logger.warning("ODOMETRY contains NaN/Inf — dropping sample")
+                    continue
+
+                # Reject zero-norm quaternions (corrupt data)
+                q_norm = float(np.linalg.norm(q_ned))
+                if q_norm < 1e-6:
+                    self._nan_count += 1
+                    logger.warning("ODOMETRY quaternion near-zero norm — dropping")
+                    continue
+
+                t = self._telemetry
+                t.odometry_position = ned_to_enu(pos_ned)
+                t.odometry_velocity = ned_to_enu(vel_ned)
+                t.odometry_orientation = quat_ned_to_enu(q_ned / q_norm)
 
                 t.odometry_valid = True
-                t.timestamp_ns = time.monotonic_ns()
+                now = time.monotonic_ns()
+                t.timestamp_ns = now
+                t.last_odometry_ns = now
         except asyncio.CancelledError:
             pass
         except Exception:
