@@ -147,7 +147,8 @@ def run_pipeline(
     logger.info("Racing line: %.1fm total length", racing_line.total_length)
 
     # --- Initialise modules ---
-    use_neural = detector_type == "neural" and use_perception
+    use_neural = detector_type in ("neural", "hybrid") and use_perception
+    use_hybrid = detector_type == "hybrid" and use_perception
     sim = MockSimAdapter(
         camera_config=config.camera,
         gates=gates,
@@ -158,11 +159,12 @@ def run_pipeline(
 
     # Neural detector keypoints are less precise than classical corners,
     # so PnP measurements need higher noise to avoid corrupting the ESKF.
-    if use_neural:
+    if use_neural and not use_hybrid:
         pnp_pos_noise = 8.0  # neural keypoints → very noisy PnP (rough hint only)
         pnp_ori_noise = 3.0
         chi2_threshold = 100.0  # accept most measurements — noise model handles weighting
     else:
+        # Classical and hybrid both use classical-quality corners
         pnp_pos_noise = 0.5
         pnp_ori_noise = 0.5
         chi2_threshold = 20.0
@@ -188,7 +190,24 @@ def run_pipeline(
     eskf = ESKF(mock_config)
 
     # Perception modules (only needed when use_perception=True)
-    if use_neural:
+    hybrid_detector = None
+    if use_hybrid:
+        from drone_racing.perception.hybrid import HybridDetector, HybridDetectorConfig
+
+        # Hybrid: neural bboxes + classical corner refinement → precise PnP
+        gate_corners_3d_local = config.gate.corners_3d_array
+        hybrid_cfg = HybridDetectorConfig(
+            neural=NeuralDetectorConfig(
+                model_path="runs/pose/runs/pose/train/weights/best.onnx",
+                conf_threshold=0.15,
+                num_keypoints=8,
+                providers=["CPUExecutionProvider"],
+            ),
+        )
+        hybrid_detector = HybridDetector(hybrid_cfg, camera_config=config.camera)
+        hybrid_detector.load()
+        logger.info("Detector: hybrid (neural bbox + classical corners)")
+    elif use_neural:
         # Neural detector outputs 8 geometrically-ordered corners
         # (TL,TR,BR,BL outer + inner), matching GateConfig.corners_3d.
         gate_corners_3d_local = config.gate.corners_3d_array
@@ -306,7 +325,9 @@ def run_pipeline(
 
             if use_perception:
                 # Full perception pipeline: Detect → Track → PnP → ESKF
-                if use_neural:
+                if use_hybrid and hybrid_detector is not None:
+                    detections = hybrid_detector.detect(frame, frame_ts)
+                elif use_neural:
                     detections = neural_detector.detect(frame, frame_ts)
                 else:
                     detections = classical_detector.detect(frame, frame_ts)
@@ -522,8 +543,8 @@ def main() -> None:
         "--detector",
         type=str,
         default="classical",
-        choices=["classical", "neural"],
-        help="Detector backend: classical (4-corner) or neural (8-corner ONNX)",
+        choices=["classical", "neural", "hybrid"],
+        help="Detector backend: classical, neural, or hybrid (neural bbox + classical corners)",
     )
     args = parser.parse_args()
 
