@@ -218,7 +218,7 @@ class TestHybridDetector:
 
     def test_default_config(self) -> None:
         cfg = HybridDetectorConfig()
-        assert cfg.crop_margin == pytest.approx(0.2)
+        assert cfg.crop_margin == pytest.approx(0.3)
         assert cfg.min_crop_size == 30
 
     def test_detect_without_load_raises(self) -> None:

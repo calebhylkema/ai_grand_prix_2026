@@ -61,7 +61,7 @@ class HybridDetectorConfig:
 
     neural: NeuralDetectorConfig = field(default_factory=NeuralDetectorConfig)
     classical: ClassicalDetectorConfig = field(default_factory=ClassicalDetectorConfig)
-    crop_margin: float = 0.2
+    crop_margin: float = 0.3
     min_crop_size: int = 30
 
 
@@ -231,8 +231,9 @@ def _refine_corners_in_crop(
     for idx, contour in enumerate(contours):
         area = cv2.contourArea(contour)
 
-        # Scale area thresholds relative to crop (not full image)
-        if area < crop_area * 0.05 or area > crop_area * 0.95:
+        # Scale area thresholds relative to crop — use loose bounds since
+        # the neural bbox already confirmed a gate is here.
+        if area < crop_area * 0.02 or area > crop_area * 0.98:
             continue
 
         # Skip child contours
@@ -251,7 +252,27 @@ def _refine_corners_in_crop(
             best_outer = approx.reshape(-1, 2).astype(np.float64)
             best_parent_idx = idx
 
-    if best_outer is None or len(best_outer) != 4:
+    if best_outer is None:
+        return None
+
+    # If polygon has more than 4 vertices, reduce to 4 by keeping the
+    # corners that form the largest-area quadrilateral (use convex hull
+    # corners closest to the bounding rect corners).
+    if len(best_outer) > 4:
+        rect = cv2.minAreaRect(best_outer.astype(np.float32))
+        box = cv2.boxPoints(rect)  # 4 corners of the min-area rotated rect
+        # For each box corner, find the closest polygon vertex
+        indices: list[int] = []
+        for bp in box:
+            dists = np.linalg.norm(best_outer - bp, axis=1)
+            idx = int(np.argmin(dists))
+            if idx not in indices:
+                indices.append(idx)
+        if len(indices) == 4:
+            best_outer = best_outer[indices]
+        else:
+            return None
+    elif len(best_outer) < 4:
         return None
 
     outer = _order_corners_clockwise(best_outer)
