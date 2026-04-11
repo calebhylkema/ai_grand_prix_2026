@@ -232,6 +232,27 @@ class EstimationConfig:
     pnp_orientation_noise_std: float = 0.05
     chi2_gate_threshold: float = 9.21
 
+    # ESKF correction clamps — cap single-update magnitude to prevent
+    # catastrophic state jumps from bad PnP solutions.
+    max_pos_correction: float = 0.3  # metres
+    max_vel_correction: float = 0.5  # m/s
+    max_ori_correction: float = 0.1  # radians (~6°)
+
+    # Covariance inflation after consecutive chi² rejections.
+    consecutive_rejection_limit: int = 10
+    covariance_inflation_factor: float = 1.5
+
+    # Kalman gain attenuation for non-HIGH-confidence measurements.
+    low_confidence_vel_gain: float = 0.3
+    low_confidence_ori_gain: float = 0.1
+
+    # PnP distance-based rejection thresholds.
+    pnp_min_distance: float = 2.0  # metres — too close for reliable PnP
+    pnp_max_distance: float = 18.0  # metres — angular errors amplify
+    pnp_max_position_diff: float = 15.0  # metres — sanity check vs ESKF
+    pnp_distance_norm: float = 3.0  # metres — noise scaling reference
+    pnp_gate_skip_distance: float = 25.0  # metres — skip PnP for far gates
+
 
 @dataclass(slots=True)
 class CameraConfig:

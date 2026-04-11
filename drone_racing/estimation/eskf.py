@@ -326,14 +326,13 @@ class ESKF:
             # Covariance inflation after many consecutive rejections.
             # This widens the chi² acceptance region so the filter can
             # re-acquire lock after transient divergence.
-            if self._consecutive_rejections >= 10:
-                inflate = 1.5
-                self._state.covariance *= inflate
+            if self._consecutive_rejections >= self._cfg.consecutive_rejection_limit:
+                self._state.covariance *= self._cfg.covariance_inflation_factor
                 self._cap_covariance()
                 self._consecutive_rejections = 0
                 logger.info(
-                    "ESKF: inflated covariance (%.0f consecutive rejections)",
-                    10.0,
+                    "ESKF: inflated covariance (%d consecutive rejections)",
+                    self._cfg.consecutive_rejection_limit,
                 )
             if rolled_back:
                 self._repropagate_from(imu_to_replay)
@@ -348,8 +347,8 @@ class ESKF:
         # for non-position states.  Orientation drift is the primary cause
         # of state divergence — allow partial correction to prevent it.
         if measurement.confidence != DetectionConfidence.HIGH:
-            k[3:6, :] *= 0.3  # reduced velocity correction
-            k[6:9, :] *= 0.1  # small orientation correction to fight drift
+            k[3:6, :] *= self._cfg.low_confidence_vel_gain
+            k[6:9, :] *= self._cfg.low_confidence_ori_gain
             k[9:, :] = 0.0  # still zero bias from position-only
 
         # Error-state correction
@@ -360,9 +359,9 @@ class ESKF:
         pos_corr = float(np.linalg.norm(dx[_P]))
         vel_corr = float(np.linalg.norm(dx[_V]))
         ori_corr = float(np.linalg.norm(dx[_T]))
-        max_pos_corr = 0.3  # metres — keep tight to prevent biased PnP accumulation
-        max_vel_corr = 0.5  # m/s
-        max_ori_corr = 0.1  # radians (~6°)
+        max_pos_corr = self._cfg.max_pos_correction
+        max_vel_corr = self._cfg.max_vel_correction
+        max_ori_corr = self._cfg.max_ori_correction
         if pos_corr > max_pos_corr or vel_corr > max_vel_corr or ori_corr > max_ori_corr:
             scale = min(
                 max_pos_corr / max(pos_corr, 1e-9),

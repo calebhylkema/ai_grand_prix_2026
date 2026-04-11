@@ -364,14 +364,14 @@ class PnPSolver:
         # points at extreme viewing angles) or too far away (small angular
         # errors amplify to large position errors)
         distance = float(np.linalg.norm(t_cg_vec))
-        if distance < 2.0:
+        if distance < self._est_cfg.pnp_min_distance:
             logger.debug(
                 "PnP: rejecting gate %s — distance %.1fm too close",
                 gate.gate_id,
                 distance,
             )
             return None
-        if distance > 18.0:
+        if distance > self._est_cfg.pnp_max_distance:
             logger.debug(
                 "PnP: rejecting gate %s — distance %.1fm too far",
                 gate.gate_id,
@@ -408,7 +408,7 @@ class PnPSolver:
         # Use a generous threshold — the filter itself handles outliers via chi².
         if drone_state is not None:
             pos_diff = float(np.linalg.norm(position_w - drone_state.position))
-            if pos_diff > 15.0:
+            if pos_diff > self._est_cfg.pnp_max_position_diff:
                 logger.debug(
                     "PnP: rejecting gate %s — position %.1fm from ESKF estimate",
                     gate.gate_id,
@@ -418,7 +418,7 @@ class PnPSolver:
 
         # --- Noise scaling based on distance ---
         # Scale noise with distance (farther = noisier)
-        distance_factor = max(1.0, distance / 3.0)  # normalised to ~3m
+        distance_factor = max(1.0, distance / self._est_cfg.pnp_distance_norm)
         pos_noise = self._est_cfg.pnp_position_noise_std * distance_factor
         ori_noise = self._est_cfg.pnp_orientation_noise_std * distance_factor
 
@@ -544,7 +544,7 @@ class PnPSolver:
             # Quick distance check to avoid solving PnP for far-away gates
             if drone_state is not None:
                 dist_to_gate = float(np.linalg.norm(gate.position_w - drone_state.position))
-                if dist_to_gate > 25.0:
+                if dist_to_gate > self._est_cfg.pnp_gate_skip_distance:
                     continue
 
             try:
