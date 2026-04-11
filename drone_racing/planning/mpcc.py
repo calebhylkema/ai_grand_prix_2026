@@ -136,6 +136,8 @@ class MPCCSolver:
         self._racing_line = racing_line
         self._closed = closed
         self._prev_solution: MPCCSolution | None = None
+        self._prev_lam_g: np.ndarray | None = None
+        self._prev_lam_x: np.ndarray | None = None
 
         # Build CasADi interpolants for the racing line (compiled, fast)
         self._build_path_interpolants()
@@ -504,14 +506,19 @@ class MPCCSolver:
         # --- Initial guess ---
         w0 = self._build_initial_guess(current_state, current_progress)
 
-        # --- Solve (primal warm-start only) ---
-        sol = self._solver(
-            x0=w0,
-            lbx=lbw,
-            ubx=ubw,
-            lbg=self._lbg,
-            ubg=self._ubg,
-        )
+        # --- Solve with primal + dual warm-start ---
+        solver_args: dict[str, object] = {
+            "x0": w0,
+            "lbx": lbw,
+            "ubx": ubw,
+            "lbg": self._lbg,
+            "ubg": self._ubg,
+        }
+        if self._prev_lam_g is not None:
+            solver_args["lam_g0"] = self._prev_lam_g
+        if self._prev_lam_x is not None:
+            solver_args["lam_x0"] = self._prev_lam_x
+        sol = self._solver(**solver_args)
 
         t_end = time.perf_counter()
         solve_time_ms = (t_end - t_start) * 1000.0
@@ -535,8 +542,10 @@ class MPCCSolver:
                 inputs[k, :] = w_opt[offset : offset + NU]
                 offset += NU
 
-        # Save for warm-starting next solve
+        # Save primal + dual for warm-starting next solve
         self._w0 = w_opt
+        self._prev_lam_g = np.array(sol["lam_g"]).flatten()
+        self._prev_lam_x = np.array(sol["lam_x"]).flatten()
 
         result = MPCCSolution(
             success=success,
