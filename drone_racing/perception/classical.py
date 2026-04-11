@@ -224,9 +224,11 @@ class ClassicalDetector:
         self._cfg = config or ClassicalDetectorConfig()
         self._camera_cfg = camera_config
 
-        # Pre-build morphological kernel
+        # Pre-build morphological kernel and HSV bounds to avoid per-frame allocation
         ks = self._cfg.morph_kernel_size
         self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ks, ks))
+        self._hsv_lower = np.array(self._cfg.hsv_lower, dtype=np.uint8)
+        self._hsv_upper = np.array(self._cfg.hsv_upper, dtype=np.uint8)
 
         # Pre-build undistortion maps if camera config provided
         self._undistort_map1: np.ndarray | None = None
@@ -267,9 +269,7 @@ class ClassicalDetector:
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
 
         # --- Threshold ---
-        lower = np.array(self._cfg.hsv_lower, dtype=np.uint8)
-        upper = np.array(self._cfg.hsv_upper, dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.inRange(hsv, self._hsv_lower, self._hsv_upper)
 
         # --- Morphological cleanup ---
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._morph_kernel)
