@@ -12,8 +12,10 @@ import pytest
 from drone_racing.perception.neural import (
     NeuralDetector,
     NeuralDetectorConfig,
+    _clockwise_from_topleft,
     _letterbox,
     _nms,
+    order_corners,
 )
 
 
@@ -192,3 +194,70 @@ class TestNeuralDetector:
         image = np.zeros((640, 640, 3), dtype=np.uint8)
         detections = detector.detect(image, timestamp_ns=0)
         assert len(detections) == 0
+
+
+class TestClockwiseFromTopleft:
+    """Tests for clockwise corner sorting."""
+
+    def test_already_ordered(self) -> None:
+        corners = np.array([[100, 100], [200, 100], [200, 200], [100, 200]], dtype=np.float64)
+        result = _clockwise_from_topleft(corners)
+        np.testing.assert_array_equal(result, corners)
+
+    def test_shuffled_square(self) -> None:
+        expected = np.array([[100, 100], [200, 100], [200, 200], [100, 200]], dtype=np.float64)
+        shuffled = expected[[2, 0, 3, 1]]
+        result = _clockwise_from_topleft(shuffled)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_reversed_order(self) -> None:
+        expected = np.array([[10, 10], [50, 10], [50, 50], [10, 50]], dtype=np.float64)
+        result = _clockwise_from_topleft(expected[::-1])
+        np.testing.assert_array_equal(result, expected)
+
+    def test_non_square_quad(self) -> None:
+        corners = np.array([[80, 60], [320, 80], [300, 280], [100, 260]], dtype=np.float64)
+        result = _clockwise_from_topleft(corners)
+        # TL should have smallest x+y sum, BR should have largest
+        assert result[0, 0] < result[1, 0]  # TL.x < TR.x
+        assert result[0, 1] < result[3, 1]  # TL.y < BL.y
+        assert result[2, 0] > result[3, 0]  # BR.x > BL.x
+
+    def test_wrong_count_returns_as_is(self) -> None:
+        corners = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.float64)
+        result = _clockwise_from_topleft(corners)
+        np.testing.assert_array_equal(result, corners)
+
+
+class TestOrderCorners:
+    """Tests for the full corner ordering function."""
+
+    def test_four_corners(self) -> None:
+        expected = np.array([[100, 100], [200, 100], [200, 200], [100, 200]], dtype=np.float64)
+        shuffled = expected[[3, 1, 0, 2]]
+        result = order_corners(shuffled, 4)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_eight_corners_outer_inner_separation(self) -> None:
+        outer = np.array([[100, 100], [300, 100], [300, 300], [100, 300]], dtype=np.float64)
+        inner = np.array([[150, 150], [250, 150], [250, 250], [150, 250]], dtype=np.float64)
+        combined = np.vstack([outer, inner])
+        shuffled = combined[[5, 2, 7, 0, 4, 1, 6, 3]]
+        result = order_corners(shuffled, 8)
+        np.testing.assert_array_equal(result[:4], outer)
+        np.testing.assert_array_equal(result[4:], inner)
+
+    def test_eight_corners_outer_farther_than_inner(self) -> None:
+        outer = np.array([[50, 50], [350, 50], [350, 350], [50, 350]], dtype=np.float64)
+        inner = np.array([[130, 130], [270, 130], [270, 270], [130, 270]], dtype=np.float64)
+        combined = np.vstack([outer, inner])
+        result = order_corners(combined[np.random.permutation(8)], 8)
+        centroid = result.mean(axis=0)
+        outer_d = np.linalg.norm(result[:4] - centroid, axis=1).mean()
+        inner_d = np.linalg.norm(result[4:] - centroid, axis=1).mean()
+        assert outer_d > inner_d
+
+    def test_other_count_returned_as_is(self) -> None:
+        corners = np.array([[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]], dtype=np.float64)
+        result = order_corners(corners, 8)
+        np.testing.assert_array_equal(result, corners)

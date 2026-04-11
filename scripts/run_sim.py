@@ -35,6 +35,7 @@ from drone_racing.control.rate_limiter import CommandRateLimiter
 from drone_racing.estimation.eskf import ESKF
 from drone_racing.logging.flight_logger import FlightLogger
 from drone_racing.perception.classical import ClassicalDetector
+from drone_racing.perception.neural import NeuralDetector, NeuralDetectorConfig
 from drone_racing.perception.pnp import PnPSolver
 from drone_racing.perception.tracker import GateTracker
 from drone_racing.planning.spline import build_racing_line
@@ -102,6 +103,7 @@ def run_pipeline(
     log_path: str | None = None,
     controller_type: str = "pid",
     use_perception: bool = True,
+    detector_type: str = "classical",
 ) -> dict[str, object]:
     """Run the full autonomy pipeline in the mock simulator.
 
@@ -118,8 +120,10 @@ def run_pipeline(
     controller_type : str
         Controller to use: ``"pid"`` or ``"mpcc"``.
     use_perception : bool
-        If True (default), use classical detector + PnP pipeline.
+        If True (default), use detector + PnP pipeline.
         If False, use ground-truth-based synthetic measurements.
+    detector_type : str
+        Detector backend: ``"classical"`` (4-corner) or ``"neural"`` (8-corner ONNX).
 
     Returns
     -------
@@ -143,6 +147,7 @@ def run_pipeline(
     logger.info("Racing line: %.1fm total length", racing_line.total_length)
 
     # --- Initialise modules ---
+    use_neural = detector_type == "neural" and use_perception
     sim = MockSimAdapter(
         camera_config=config.camera,
         gates=gates,
@@ -151,15 +156,25 @@ def run_pipeline(
     # Tune estimation for mock sim: no real IMU bias, PnP is reasonably accurate
     from drone_racing.utils.types import EstimationConfig
 
+    # Neural detector keypoints are less precise than classical corners,
+    # so PnP measurements need higher noise to avoid corrupting the ESKF.
+    if use_neural:
+        pnp_pos_noise = 8.0  # neural keypoints → very noisy PnP (rough hint only)
+        pnp_ori_noise = 3.0
+        chi2_threshold = 100.0  # accept most measurements — noise model handles weighting
+    else:
+        pnp_pos_noise = 0.5
+        pnp_ori_noise = 0.5
+        chi2_threshold = 20.0
     mock_est = EstimationConfig(
         imu_rate_hz=config.estimation.imu_rate_hz,
         gyro_noise_std=config.estimation.gyro_noise_std,
         accel_noise_std=config.estimation.accel_noise_std,
         gyro_bias_std=1e-6,  # mock sim has no IMU bias — suppress random walk
         accel_bias_std=1e-6,
-        pnp_position_noise_std=0.5,  # conservative — mock sim PnP can be noisy
-        pnp_orientation_noise_std=0.5,
-        chi2_gate_threshold=20.0,
+        pnp_position_noise_std=pnp_pos_noise,
+        pnp_orientation_noise_std=pnp_ori_noise,
+        chi2_gate_threshold=chi2_threshold,
     )
     from drone_racing.utils.config import RacingConfig
 
@@ -173,12 +188,26 @@ def run_pipeline(
     eskf = ESKF(mock_config)
 
     # Perception modules (only needed when use_perception=True)
-    # PnP uses outer 4 corners — classical detector's polygon approximation
-    # is too noisy for 8-corner PnP. The detector still returns 8 corners
-    # for confidence scoring (6+ corners → HIGH confidence in ESKF).
-    # Neural detector will use the full 8-corner model.
-    gate_corners_3d_local = config.gate.outer_corners_3d_array
-    detector = ClassicalDetector(camera_config=config.camera)
+    if use_neural:
+        # Neural detector outputs 8 geometrically-ordered corners
+        # (TL,TR,BR,BL outer + inner), matching GateConfig.corners_3d.
+        gate_corners_3d_local = config.gate.corners_3d_array
+        neural_cfg = NeuralDetectorConfig(
+            model_path="runs/pose/runs/pose/train/weights/best.onnx",
+            conf_threshold=0.15,
+            num_keypoints=8,
+            providers=["CPUExecutionProvider"],
+        )
+        neural_detector = NeuralDetector(neural_cfg)
+        neural_detector.load()
+        logger.info("Detector: neural (8-corner ONNX)")
+    else:
+        # Classical detector's polygon approximation is too noisy for
+        # 8-corner PnP — use outer 4 corners only.
+        gate_corners_3d_local = config.gate.outer_corners_3d_array
+        logger.info("Detector: classical (4-corner)")
+
+    classical_detector = ClassicalDetector(camera_config=config.camera)
     tracker = GateTracker()
     pnp = PnPSolver(config.camera, mock_est, max_reprojection_px=50.0)
 
@@ -277,7 +306,10 @@ def run_pipeline(
 
             if use_perception:
                 # Full perception pipeline: Detect → Track → PnP → ESKF
-                detections = detector.detect(frame, frame_ts)
+                if use_neural:
+                    detections = neural_detector.detect(frame, frame_ts)
+                else:
+                    detections = classical_detector.detect(frame, frame_ts)
                 tracked = tracker.update(detections)
 
                 # Assign gate map IDs using current state estimate
@@ -340,19 +372,22 @@ def run_pipeline(
         # Controller selection:
         # - MPCC + synthetic measurements: works perfectly, use for MPCC dev
         # - PID + real perception: works perfectly, use for perception dev
-        # - MPCC + real perception: degrades to PID — 4-corner PnP produces
-        #   biased measurements under MPCC's aggressive maneuvers. Will work
-        #   once we have 8-corner neural detection (VQ2).
+        # - MPCC + classical perception: degrades to PID — 4-corner PnP
+        #   produces biased measurements under aggressive maneuvers.
+        # - MPCC + neural perception: 8-corner PnP should be reliable
+        #   enough for MPCC — test this hypothesis.
         mpcc_active = mpcc_controller is not None
-        if mpcc_active and use_perception:
-            # With real perception, use PID — MPCC causes PnP bias feedback
-            # loop that corrupts the ESKF state estimate.
+        if mpcc_active and use_perception and not use_neural:
+            # Classical 4-corner PnP is unreliable under MPCC's aggressive
+            # maneuvers — fall back to PID.  Neural 8-corner PnP should
+            # fix this once keypoint accuracy improves (needs real sim data).
             mpcc_active = False
             if not bootstrap_logged:
                 bootstrap_logged = True
                 logger.info(
-                    "MPCC + real perception: using PID (4-corner PnP unreliable "
-                    "under aggressive maneuvers; use --no-perception for MPCC)"
+                    "MPCC + classical perception: using PID (4-corner PnP "
+                    "unreliable under aggressive maneuvers; use --detector "
+                    "neural or --no-perception for MPCC)"
                 )
 
         if mpcc_active:
@@ -418,6 +453,7 @@ def run_pipeline(
 
     stats: dict[str, object] = {
         "controller": controller_type,
+        "detector": detector_type,
         "gates_passed": sim.gates_passed,
         "laps_completed": sim.laps_completed,
         "sim_time_s": sim_elapsed,
@@ -441,7 +477,7 @@ def run_pipeline(
     print("  SIMULATION COMPLETE")
     print("=" * 60)
     print(f"  Controller:       {controller_type.upper()}")
-    print(f"  Perception:       {'real' if use_perception else 'synthetic'}")
+    print(f"  Detector:         {detector_type if use_perception else 'synthetic'}")
     print(f"  Gates passed:     {sim.gates_passed}")
     print(f"  Laps completed:   {sim.laps_completed}")
     print(f"  Sim time:         {sim_elapsed:.1f}s")
@@ -482,6 +518,13 @@ def main() -> None:
         action="store_true",
         help="Use synthetic measurements instead of real perception pipeline",
     )
+    parser.add_argument(
+        "--detector",
+        type=str,
+        default="classical",
+        choices=["classical", "neural"],
+        help="Detector backend: classical (4-corner) or neural (8-corner ONNX)",
+    )
     args = parser.parse_args()
 
     # Setup logging
@@ -500,6 +543,7 @@ def main() -> None:
         log_path=args.log_path,
         controller_type=args.controller,
         use_perception=not args.no_perception,
+        detector_type=args.detector,
     )
 
 

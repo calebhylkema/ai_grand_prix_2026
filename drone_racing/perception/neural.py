@@ -30,6 +30,112 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Corner ordering
+# ---------------------------------------------------------------------------
+
+
+def _clockwise_from_topleft(corners: np.ndarray) -> np.ndarray:
+    """Sort corners clockwise starting from top-left.
+
+    Parameters
+    ----------
+    corners : np.ndarray
+        (N, 2) pixel coordinates.
+
+    Returns
+    -------
+    np.ndarray
+        (N, 2) sorted corners: TL, TR, BR, BL.
+    """
+    if len(corners) != 4:
+        return corners
+
+    cx = corners[:, 0].mean()
+    cy = corners[:, 1].mean()
+
+    # Classify each corner into a quadrant relative to the centroid.
+    # In image coords: top-left = (x < cx, y < cy), etc.
+    tl_idx = -1
+    tr_idx = -1
+    bl_idx = -1
+    br_idx = -1
+
+    for i in range(4):
+        left = corners[i, 0] < cx
+        top = corners[i, 1] < cy
+        if top and left:
+            tl_idx = i
+        elif top and not left:
+            tr_idx = i
+        elif not top and left:
+            bl_idx = i
+        else:
+            br_idx = i
+
+    # If quadrant assignment is clean, use it directly
+    indices = [tl_idx, tr_idx, br_idx, bl_idx]
+    if -1 not in indices and len(set(indices)) == 4:
+        return corners[indices]
+
+    # Fallback: sort by angle from centroid (atan2), starting from top-left
+    # direction (negative x, negative y → angle ≈ -3π/4 in standard math,
+    # but in image coords y is flipped).
+    angles = np.arctan2(corners[:, 1] - cy, corners[:, 0] - cx)
+    # Rotate so that top-left (angle ≈ -3π/4) becomes the start
+    # Top-left in image coords: x<cx, y<cy → angle is in (-π, -π/2)
+    # Shift angles so that -π maps to 0, giving clockwise TL→TR→BR→BL
+    shifted = (angles + np.pi) % (2 * np.pi)
+    order = np.argsort(shifted)
+    return corners[order]
+
+
+def order_corners(
+    corners: np.ndarray,
+    num_keypoints: int,
+) -> np.ndarray:
+    """Order detected corners into canonical TL,TR,BR,BL format.
+
+    For 8 keypoints: separates outer (farther from centroid) and inner
+    (closer) groups, then sorts each clockwise from top-left.  This
+    matches the ``GateConfig.corners_3d`` convention.
+
+    For 4 keypoints: sorts clockwise from top-left directly.
+
+    Parameters
+    ----------
+    corners : np.ndarray
+        (N, 2) detected corner pixel coordinates.
+    num_keypoints : int
+        Expected number of keypoints (4 or 8).
+
+    Returns
+    -------
+    np.ndarray
+        (N, 2) corners in canonical order.
+    """
+    n = len(corners)
+
+    if n == 4:
+        return _clockwise_from_topleft(corners)
+
+    if n == 8 and num_keypoints == 8:
+        centroid = corners.mean(axis=0)
+        dists = np.linalg.norm(corners - centroid, axis=1)
+
+        # The 4 corners farthest from centroid are outer
+        sorted_idx = np.argsort(dists)
+        inner_idx = sorted_idx[:4]
+        outer_idx = sorted_idx[4:]
+
+        outer = _clockwise_from_topleft(corners[outer_idx])
+        inner = _clockwise_from_topleft(corners[inner_idx])
+        return np.vstack([outer, inner])
+
+    # For other counts, return as-is (best effort)
+    return corners
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -405,6 +511,10 @@ class NeuralDetector:
             kp_confs = kp_raw[:, 2]
             visible_mask = kp_confs > 0.5
             visible_corners = corners[visible_mask]
+
+            # Order corners into canonical TL,TR,BR,BL format
+            # so they match GateConfig.corners_3d for PnP
+            visible_corners = order_corners(visible_corners, n_kp)
 
             det_conf = float(conf[idx])
             # Boost confidence if all 8 keypoints are visible
