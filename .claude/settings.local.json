@@ -5,7 +5,19 @@
       "Bash(gh auth:*)",
       "Bash(winget install:*)",
       "Bash(export PATH=\"/c/Program Files/GitHub CLI:$PATH\")",
-      "Bash(gh --version)"
+      "Bash(gh --version)",
+      "Bash(gh repo:*)",
+      "Read(//tmp/**)",
+      "Bash(ls -t logs/flight_*.npz)",
+      "Bash(wc -l docs/*.md docs/adr/*.md)",
+      "Bash(wc -l drone_racing/*/CLAUDE.md)",
+      "Bash(grep -E \"\\(Gate.*passed|SIMULATION|Gates passed|Laps|Controller|Perception|pos_err|DIAG t=\\(0|10|20|30|40|50\\)\\\\\\\\.\\)\")",
+      "Bash(find:*)",
+      "Bash(uv add:*)",
+      "Bash(ls -la *.pt)",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(uv pip:*)",
+      "Bash(wc -l scripts/run_race.py scripts/run_sim.py drone_racing/perception/tracker.py drone_racing/logging/*.py)"
     ]
   }
 }
