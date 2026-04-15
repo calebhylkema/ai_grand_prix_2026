@@ -287,56 +287,62 @@ class PnPSolver:
         img_pts = corners_2d[:n_use].astype(np.float64)
 
         # --- Corner matching + PnP ---
-        if drone_state is not None:
-            rvec_guess, tvec_guess = self._compute_approximate_t_cg(drone_state, gate)
+        try:
+            if drone_state is not None:
+                rvec_guess, tvec_guess = self._compute_approximate_t_cg(drone_state, gate)
 
-            # Match 2D→3D corner ordering. For 8 corners, match outer and
-            # inner rings separately to prevent cross-assignment.
-            if n_use <= 4:
-                obj_pts = self._match_corners(
-                    gate_corners_3d_local[:n_use],
-                    img_pts,
-                    rvec_guess,
-                    tvec_guess,
-                )
-            else:
-                # Match outer 4 and inner 4 independently
-                outer_3d = self._match_corners(
-                    gate_corners_3d_local[:4], img_pts[:4], rvec_guess, tvec_guess
-                )
-                inner_3d = self._match_corners(
-                    gate_corners_3d_local[4:n_use],
-                    img_pts[4:n_use],
-                    rvec_guess,
-                    tvec_guess,
-                )
-                obj_pts = np.vstack([outer_3d, inner_3d])
+                # Match 2D→3D corner ordering. For 8 corners, match outer and
+                # inner rings separately to prevent cross-assignment.
+                if n_use <= 4:
+                    obj_pts = self._match_corners(
+                        gate_corners_3d_local[:n_use],
+                        img_pts,
+                        rvec_guess,
+                        tvec_guess,
+                    )
+                else:
+                    # Match outer 4 and inner 4 independently
+                    outer_3d = self._match_corners(
+                        gate_corners_3d_local[:4], img_pts[:4], rvec_guess, tvec_guess
+                    )
+                    inner_3d = self._match_corners(
+                        gate_corners_3d_local[4:n_use],
+                        img_pts[4:n_use],
+                        rvec_guess,
+                        tvec_guess,
+                    )
+                    obj_pts = np.vstack([outer_3d, inner_3d])
 
-            if n_use >= 6:
-                # 6+ corners: use IPPE (coplanar solver) which returns both
-                # solutions, then pick the one closest to our ESKF estimate.
-                success, rvec, tvec = self._solve_pnp_ippe_best(obj_pts, img_pts, drone_state, gate)
+                if n_use >= 6:
+                    # 6+ corners: use IPPE (coplanar solver) which returns both
+                    # solutions, then pick the one closest to our ESKF estimate.
+                    success, rvec, tvec = self._solve_pnp_ippe_best(
+                        obj_pts, img_pts, drone_state, gate
+                    )
+                else:
+                    # 4 corners: ITERATIVE with extrinsic guess
+                    success, rvec, tvec = cv2.solvePnP(
+                        obj_pts,
+                        img_pts,
+                        self._camera_k,
+                        self._camera_dist,
+                        rvec=rvec_guess.copy(),
+                        tvec=tvec_guess.copy(),
+                        useExtrinsicGuess=True,
+                        flags=cv2.SOLVEPNP_ITERATIVE,
+                    )
             else:
-                # 4 corners: ITERATIVE with extrinsic guess
+                obj_pts = gate_corners_3d_local[:n_use].astype(np.float64)
                 success, rvec, tvec = cv2.solvePnP(
                     obj_pts,
                     img_pts,
                     self._camera_k,
                     self._camera_dist,
-                    rvec=rvec_guess.copy(),
-                    tvec=tvec_guess.copy(),
-                    useExtrinsicGuess=True,
                     flags=cv2.SOLVEPNP_ITERATIVE,
                 )
-        else:
-            obj_pts = gate_corners_3d_local[:n_use].astype(np.float64)
-            success, rvec, tvec = cv2.solvePnP(
-                obj_pts,
-                img_pts,
-                self._camera_k,
-                self._camera_dist,
-                flags=cv2.SOLVEPNP_ITERATIVE,
-            )
+        except cv2.error:
+            logger.debug("PnP: OpenCV error for gate %s — degenerate geometry", gate.gate_id)
+            return None
 
         if not success:
             logger.debug("PnP: solvePnP failed for gate %s", gate.gate_id)

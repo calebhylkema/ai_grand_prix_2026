@@ -249,3 +249,124 @@ class TestResetBehaviour:
         ctrl.reset()
         assert ctrl._last_solution is None
         assert ctrl._solution_step == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: State-unreliable fallback
+# ---------------------------------------------------------------------------
+
+
+class TestStateUnreliableFallback:
+    """Extremely high covariance trace triggers PID fallback."""
+
+    def test_huge_covariance_triggers_fallback(self) -> None:
+        ctrl = _build_mpcc_controller()
+        ctrl.reset()
+
+        # State with enormous covariance → state unreliable
+        state = _make_state(ts=1_000_000, pos=(5.0, 0.0, 0.0), cov_scale=1e12)
+        cmd = ctrl.update(state)
+
+        stats = ctrl.last_stats
+        assert stats is not None
+        assert stats.fallback_reason == FallbackReason.STATE_UNRELIABLE
+        assert 0.0 <= cmd.throttle <= 1.0
+
+    def test_normal_covariance_does_not_trigger(self) -> None:
+        ctrl = _build_mpcc_controller()
+        ctrl.reset()
+
+        mock_sol = MagicMock()
+        mock_sol.success = True
+        mock_sol.inputs = np.array([[0.5, 0.0, 0.0, 0.0]])
+        mock_sol.progress = np.array([0.0, 0.01])
+        mock_sol.solve_time_ms = 5.0
+        ctrl._mpcc.solve.return_value = mock_sol
+
+        state = _make_state(ts=1_000_000, pos=(5.0, 0.0, 0.0), cov_scale=1e-3)
+        ctrl.update(state)
+
+        stats = ctrl.last_stats
+        assert stats is not None
+        assert stats.fallback_reason != FallbackReason.STATE_UNRELIABLE
+
+
+# ---------------------------------------------------------------------------
+# Tests: Inter-plan stepping (reuse solution between re-plans)
+# ---------------------------------------------------------------------------
+
+
+class TestInterPlanStepping:
+    """Between re-plans, the controller should step through the solution."""
+
+    def test_reuses_solution_within_replan_interval(self) -> None:
+        ctrl = _build_mpcc_controller()
+        ctrl.reset()
+
+        # Multi-step solution
+        mock_sol = MagicMock()
+        mock_sol.success = True
+        mock_sol.inputs = np.array(
+            [
+                [0.5, 0.0, 0.0, 0.0],
+                [0.55, 0.01, 0.0, 0.0],
+                [0.6, 0.02, 0.0, 0.0],
+            ]
+        )
+        mock_sol.progress = np.array([0.0, 0.01, 0.02, 0.03])
+        mock_sol.solve_time_ms = 5.0
+        ctrl._mpcc.solve.return_value = mock_sol
+
+        # First call: triggers a solve
+        ctrl.update(_make_state(ts=1_000_000))
+        assert ctrl._mpcc.solve.call_count == 1
+
+        # Second call immediately after: should reuse solution (within replan interval)
+        ctrl.update(_make_state(ts=1_000_001))
+        # Solution step should have advanced
+        assert ctrl._solution_step >= 2
+
+    def test_consecutive_failures_increment(self) -> None:
+        ctrl = _build_mpcc_controller()
+        ctrl.reset()
+
+        mock_sol = MagicMock()
+        mock_sol.success = False
+        mock_sol.solve_time_ms = 15.0
+        ctrl._mpcc.solve.return_value = mock_sol
+
+        ctrl.update(_make_state(ts=1_000_000))
+        assert ctrl._consecutive_failures == 1
+
+        ctrl.update(_make_state(ts=100_000_000))
+        assert ctrl._consecutive_failures == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: Command clamping
+# ---------------------------------------------------------------------------
+
+
+class TestCommandClamping:
+    """Output commands should be clamped to physical limits."""
+
+    def test_output_within_limits(self) -> None:
+        ctrl = _build_mpcc_controller()
+        ctrl.reset()
+
+        # Large-magnitude MPCC output
+        mock_sol = MagicMock()
+        mock_sol.success = True
+        mock_sol.inputs = np.array([[0.8, 3.0, -3.0, 10.0]])  # extreme angles/rates
+        mock_sol.progress = np.array([0.0, 0.01])
+        mock_sol.solve_time_ms = 5.0
+        ctrl._mpcc.solve.return_value = mock_sol
+
+        state = _make_state(ts=1_000_000)
+        cmd = ctrl.update(state)
+
+        cfg = ctrl._cfg
+        assert 0.0 <= cmd.throttle <= cfg.max_thrust
+        assert abs(cmd.roll_rate) <= cfg.max_roll_rate + 1e-6
+        assert abs(cmd.pitch_rate) <= cfg.max_pitch_rate + 1e-6
+        assert abs(cmd.yaw_rate) <= cfg.max_yaw_rate + 1e-6
