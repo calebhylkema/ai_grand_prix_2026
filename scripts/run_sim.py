@@ -104,6 +104,7 @@ def run_pipeline(
     controller_type: str = "pid",
     use_perception: bool = True,
     detector_type: str = "classical",
+    rl_checkpoint: str | None = None,
 ) -> dict[str, object]:
     """Run the full autonomy pipeline in the mock simulator.
 
@@ -118,12 +119,14 @@ def run_pipeline(
     log_path : str | None
         Path to save the flight log. None = auto-generate.
     controller_type : str
-        Controller to use: ``"pid"`` or ``"mpcc"``.
+        Controller to use: ``"pid"``, ``"mpcc"``, or ``"rl"``.
     use_perception : bool
         If True (default), use detector + PnP pipeline.
         If False, use ground-truth-based synthetic measurements.
     detector_type : str
         Detector backend: ``"classical"`` (4-corner) or ``"neural"`` (8-corner ONNX).
+    rl_checkpoint : str | None
+        Path to SB3 model ``.zip`` (required when ``controller_type="rl"``).
 
     Returns
     -------
@@ -248,8 +251,9 @@ def run_pipeline(
     )
     pid_controller = PIDController(mock_control)
 
-    # Build MPCC controller if requested
+    # Build MPCC or RL controller if requested
     mpcc_controller = None
+    rl_controller = None
     if controller_type == "mpcc":
         from drone_racing.control.mpcc_adapter import MPCCController
         from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
@@ -264,6 +268,15 @@ def run_pipeline(
             attitude_tau=mpcc_cfg.dynamics.attitude_tau,
         )
         logger.info("Controller: MPCC with PID fallback")
+    elif controller_type == "rl":
+        from drone_racing.control.rl_controller import RLController
+
+        rl_controller = RLController.from_checkpoint(
+            rl_checkpoint,
+            racing_line=racing_line,
+            control_config=mock_control,
+        )
+        logger.info("Controller: RL policy from %s", rl_checkpoint)
     else:
         logger.info("Controller: PID cascade")
 
@@ -287,9 +300,11 @@ def run_pipeline(
     sim.reset(start_telemetry)
     eskf.initialise(start_telemetry)
     pid_controller.reset()
+    start_progress = racing_line.closest_progress(start_pos)
     if mpcc_controller is not None:
-        start_progress = racing_line.closest_progress(start_pos)
         mpcc_controller.reset(progress=start_progress)
+    if rl_controller is not None:
+        rl_controller.reset(progress=start_progress)
 
     flight_log.set_metadata("start_position", start_pos)
     flight_log.set_metadata("num_gates", len(gates))
@@ -411,7 +426,9 @@ def run_pipeline(
                     "neural or --no-perception for MPCC)"
                 )
 
-        if mpcc_active:
+        if rl_controller is not None:
+            cmd = rl_controller.update(current_state)
+        elif mpcc_active:
             cmd = mpcc_controller.update(current_state)
         else:
             # PID cascade with lookahead
@@ -531,8 +548,14 @@ def main() -> None:
         "--controller",
         type=str,
         default="pid",
-        choices=["pid", "mpcc"],
-        help="Controller type: pid (default) or mpcc",
+        choices=["pid", "mpcc", "rl"],
+        help="Controller type: pid (default), mpcc, or rl",
+    )
+    parser.add_argument(
+        "--rl-checkpoint",
+        type=str,
+        default=None,
+        help="Path to SB3 model .zip (required when --controller rl)",
     )
     parser.add_argument(
         "--no-perception",
@@ -547,6 +570,9 @@ def main() -> None:
         help="Detector backend: classical, neural, or hybrid (neural bbox + classical corners)",
     )
     args = parser.parse_args()
+
+    if args.controller == "rl" and args.rl_checkpoint is None:
+        parser.error("--rl-checkpoint is required when --controller rl")
 
     # Setup logging
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -565,6 +591,7 @@ def main() -> None:
         controller_type=args.controller,
         use_perception=not args.no_perception,
         detector_type=args.detector,
+        rl_checkpoint=args.rl_checkpoint,
     )
 
 

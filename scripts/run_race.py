@@ -121,6 +121,8 @@ async def run_race(
     debug: bool = False,
     record_dir: str | None = None,
     record_stride: int = 1,
+    controller_type: str = "mpcc",
+    rl_checkpoint: str | None = None,
 ) -> dict[str, object]:
     """Run the full autonomy pipeline against the real simulator.
 
@@ -132,6 +134,14 @@ async def run_race(
         Override MAVSDK connection address.
     debug : bool
         Enable verbose logging.
+    record_dir : str | None
+        Directory for frame recording.
+    record_stride : int
+        Keep every Nth frame when recording.
+    controller_type : str
+        Controller to use: ``"mpcc"`` (default), ``"pid"``, or ``"rl"``.
+    rl_checkpoint : str | None
+        Path to SB3 model ``.zip`` (required when ``controller_type="rl"``).
 
     Returns
     -------
@@ -179,6 +189,11 @@ async def run_race(
     mpcc: MPCCSolver | None = None
     racing_line: RacingLine | None = None
     mpcc_failures = 0
+
+    # RL controller (built lazily once racing line exists)
+    rl_controller = None
+    use_rl = controller_type == "rl"
+    use_mpcc = controller_type == "mpcc"
 
     # Optional frame + telemetry recorder for offline training-data capture.
     recorder: FrameRecorder | None = None
@@ -256,23 +271,41 @@ async def run_race(
             # but we only do it when the waypoint count changes to keep MPCC's
             # cached interpolants stable.
             waypoints = mapper.waypoints()
-            if len(waypoints) >= MIN_MAPPED_GATES_FOR_MPCC and mpcc is None:
+            if len(waypoints) >= MIN_MAPPED_GATES_FOR_MPCC and racing_line is None:
                 try:
                     racing_line = _build_racing_line_from_waypoints(
                         waypoints, config.planner, closed=True
                     )
-                    mpcc = MPCCSolver.from_planner_config(racing_line, config.planner, closed=True)
-                    logger.info(
-                        "Racing line built from %d gates — switching to MPCC",
-                        len(waypoints),
-                    )
+                    if use_rl:
+                        from drone_racing.control.rl_controller import RLController
+
+                        rl_controller = RLController.from_checkpoint(
+                            rl_checkpoint,  # type: ignore[arg-type]
+                            racing_line=racing_line,
+                            control_config=config.control,
+                        )
+                        logger.info(
+                            "Racing line built from %d gates — switching to RL",
+                            len(waypoints),
+                        )
+                    elif use_mpcc:
+                        mpcc = MPCCSolver.from_planner_config(
+                            racing_line, config.planner, closed=True
+                        )
+                        logger.info(
+                            "Racing line built from %d gates — switching to MPCC",
+                            len(waypoints),
+                        )
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed to build racing line — staying on PID hover")
                     mpcc = None
                     racing_line = None
+                    rl_controller = None
 
             cmd: DroneCommand | None = None
-            if mpcc is not None and racing_line is not None:
+            if rl_controller is not None and racing_line is not None:
+                cmd = rl_controller.update(current_state)
+            elif mpcc is not None and racing_line is not None:
                 try:
                     # MPCC state is 9D: [px, py, pz, vx, vy, vz, phi, theta, psi]
                     roll, pitch, yaw = _extract_euler(current_state)
@@ -404,7 +437,23 @@ def main() -> None:
         default=1,
         help="When recording, keep every Nth frame (default 1 = every frame).",
     )
+    parser.add_argument(
+        "--controller",
+        type=str,
+        default="mpcc",
+        choices=["pid", "mpcc", "rl"],
+        help="Controller type: mpcc (default), pid, or rl",
+    )
+    parser.add_argument(
+        "--rl-checkpoint",
+        type=str,
+        default=None,
+        help="Path to SB3 model .zip (required when --controller rl)",
+    )
     args = parser.parse_args()
+
+    if args.controller == "rl" and args.rl_checkpoint is None:
+        parser.error("--rl-checkpoint is required when --controller rl")
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
@@ -419,6 +468,8 @@ def main() -> None:
             debug=args.debug,
             record_dir=args.record,
             record_stride=args.record_stride,
+            controller_type=args.controller,
+            rl_checkpoint=args.rl_checkpoint,
         )
     )
 

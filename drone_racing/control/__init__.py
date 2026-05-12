@@ -17,3 +17,11 @@ try:
     __all__ += ["MPCCController", "MPCCControllerStats"]
 except ImportError:
     pass
+
+# RL controller requires stable-baselines3 + torch (optional dependency)
+try:
+    from drone_racing.control.rl_controller import RLController, RLControllerStats
+
+    __all__ += ["RLController", "RLControllerStats"]
+except ImportError:
+    pass

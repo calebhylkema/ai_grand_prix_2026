@@ -126,10 +126,11 @@ def train(args: argparse.Namespace) -> None:
     try:
         from stable_baselines3 import PPO
         from stable_baselines3.common.callbacks import (
+            BaseCallback,
             CheckpointCallback,
             EvalCallback,
         )
-        from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+        from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
     except ImportError as e:
         msg = (
             "RL dependencies not installed. Run: uv pip install -e '.[rl]'\n"
@@ -157,17 +158,42 @@ def train(args: argparse.Namespace) -> None:
     if args.randomize:
         logger.info("Domain randomization ENABLED (per-episode drag + start jitter)")
 
-    # Create vectorized environments
+    # Create vectorized environments with observation normalization.
+    # VecNormalize maintains a running mean/std of observations and
+    # normalises them to zero-mean unit-variance before feeding the policy.
+    # This dramatically improves PPO stability for observations that span
+    # different scales (position in metres vs. progress in [0,1]).
     def make_train_env() -> DroneRacingEnv:
         return make_env(gates, racing_line, env_config)
 
     if args.n_envs > 1:
-        vec_env = SubprocVecEnv([make_train_env for _ in range(args.n_envs)])
+        raw_train_env = SubprocVecEnv([make_train_env for _ in range(args.n_envs)])
     else:
-        vec_env = DummyVecEnv([make_train_env])
+        raw_train_env = DummyVecEnv([make_train_env])
 
-    # Eval environment
-    eval_env = DummyVecEnv([make_train_env])
+    norm_stats_path = output_dir / "vecnormalize.pkl"
+    if args.resume and norm_stats_path.exists():
+        vec_env = VecNormalize.load(str(norm_stats_path), raw_train_env)
+        logger.info("Loaded observation normalization stats from %s", norm_stats_path)
+    else:
+        vec_env = VecNormalize(
+            raw_train_env,
+            norm_obs=True,
+            norm_reward=True,
+            clip_obs=10.0,
+            clip_reward=10.0,
+        )
+
+    # Eval environment (shares normalization stats, but does not update them)
+    raw_eval_env = DummyVecEnv([make_train_env])
+    eval_env = VecNormalize(
+        raw_eval_env,
+        norm_obs=True,
+        norm_reward=False,  # don't normalise eval rewards — we want true scale
+        clip_obs=10.0,
+    )
+    eval_env.training = False
+    eval_env.norm_reward = False
 
     # Policy network: G&CNet-style MLP (3 × 64)
     policy_kwargs = {
@@ -195,9 +221,44 @@ def train(args: argparse.Namespace) -> None:
             tensorboard_log=str(output_dir / "tensorboard"),
         )
 
+    # Callback that saves VecNormalize stats alongside model checkpoints
+    # and syncs running stats to the eval env before each evaluation.
+    class NormalizationCallback(BaseCallback):
+        """Save VecNormalize stats periodically and sync to eval env."""
+
+        def __init__(
+            self,
+            save_path: Path,
+            train_env: VecNormalize,
+            eval_env_ref: VecNormalize,
+            save_freq: int,
+        ) -> None:
+            super().__init__()
+            self._save_path = save_path
+            self._train_env = train_env
+            self._eval_env = eval_env_ref
+            self._save_freq = save_freq
+
+        def _on_step(self) -> bool:
+            # Sync running stats to eval env each step (cheap — just copy arrays)
+            self._eval_env.obs_rms = self._train_env.obs_rms
+            self._eval_env.ret_rms = self._train_env.ret_rms
+
+            if self.n_calls % self._save_freq == 0:
+                self._train_env.save(str(self._save_path))
+            return True
+
+    save_freq = max(args.timesteps // 10, 10000)
+
     # Callbacks
+    norm_cb = NormalizationCallback(
+        save_path=norm_stats_path,
+        train_env=vec_env,
+        eval_env_ref=eval_env,
+        save_freq=save_freq,
+    )
     checkpoint_cb = CheckpointCallback(
-        save_freq=max(args.timesteps // 10, 10000),
+        save_freq=save_freq,
         save_path=str(output_dir / "checkpoints"),
         name_prefix="ppo_drone",
     )
@@ -219,14 +280,20 @@ def train(args: argparse.Namespace) -> None:
     )
     model.learn(
         total_timesteps=args.timesteps,
-        callback=[checkpoint_cb, eval_cb],
+        callback=[norm_cb, checkpoint_cb, eval_cb],
         progress_bar=True,
     )
 
-    # Save final model
+    # Save final model + normalization stats
     final_path = output_dir / "final_model"
     model.save(str(final_path))
+    vec_env.save(str(norm_stats_path))
     logger.info("Training complete. Model saved to %s", final_path)
+    logger.info("Observation normalization stats saved to %s", norm_stats_path)
+
+    # Also save a copy next to the best model for easy inference loading
+    best_norm_path = output_dir / "best" / "vecnormalize.pkl"
+    vec_env.save(str(best_norm_path))
 
     vec_env.close()
     eval_env.close()
