@@ -36,7 +36,7 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from drone_racing.utils.config import load_config
 from drone_racing.utils.transforms import body_to_camera_rotation

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 from hypothesis.extra.numpy import arrays
@@ -77,9 +76,7 @@ class TestNedEnuQuaternion:
         q_enu = quat_ned_to_enu(q_ned)
         q_back = quat_enu_to_ned(q_enu)
         # The quaternion may differ by sign (q and -q are the same rotation)
-        assert np.allclose(q_ned, q_back, atol=1e-10) or np.allclose(
-            q_ned, -q_back, atol=1e-10
-        )
+        assert np.allclose(q_ned, q_back, atol=1e-10) or np.allclose(q_ned, -q_back, atol=1e-10)
 
     def test_quaternion_unit_norm(self) -> None:
         """Converted quaternions should remain unit norm."""
@@ -106,6 +103,4 @@ class TestNedEnuQuaternion:
         q_back = quat_enu_to_ned(q_enu)
 
         # q and -q represent the same rotation
-        assert np.allclose(q_ned, q_back, atol=1e-8) or np.allclose(
-            q_ned, -q_back, atol=1e-8
-        )
+        assert np.allclose(q_ned, q_back, atol=1e-8) or np.allclose(q_ned, -q_back, atol=1e-8)

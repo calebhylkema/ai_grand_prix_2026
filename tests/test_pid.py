@@ -115,12 +115,13 @@ class TestPID3:
 class TestPIDControllerHover:
     """Hover: setpoint = current position → should produce hover throttle."""
 
-    def test_hover_throttle_near_half(self, controller: PIDController) -> None:
+    def test_hover_throttle_matches_constant(self, controller: PIDController) -> None:
         state = _level_state()
         setpoint = TrajectorySetpoint(position=np.zeros(3))
         cmd = controller.update(state, setpoint)
-        # Hover throttle should be around 0.5 (gravity compensation)
-        assert 0.3 < cmd.throttle < 0.7
+        # Hover throttle is the measured AI-GP sim value (~0.30) — gravity
+        # compensation with zero position/velocity error.
+        assert 0.25 < cmd.throttle < 0.35
 
     def test_hover_rates_near_zero(self, controller: PIDController) -> None:
         state = _level_state()

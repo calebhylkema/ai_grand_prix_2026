@@ -29,7 +29,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 # Ensure project root is on path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from drone_racing.control.mpcc_adapter import MPCCController
 from drone_racing.control.pid import PIDController

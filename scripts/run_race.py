@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import sys
 import time
 from pathlib import Path
@@ -42,14 +43,95 @@ from drone_racing.perception.classical import ClassicalDetector
 from drone_racing.perception.tracker import GateTracker
 from drone_racing.planning.mpcc import MPCCSolver
 from drone_racing.planning.spline import RacingLine, build_racing_line
-from drone_racing.sim.mavsdk_adapter import MAVSDKAdapter
+from drone_racing.sim.mavlink_adapter import MAVLinkAdapter
 from drone_racing.utils.config import load_config
 from drone_racing.utils.types import DroneCommand, GateDetection, State
 
 logger = logging.getLogger(__name__)
 
+# Measured hover throttle for the AI-GP sim (2026-06-02 via hover_probe.py).
+# At pitch=17.8° nose-down, throttle 0.40 produced +2.5 m/s² vertical accel
+# which back-solved to a level-hover throttle of ~0.30.  Smoke 015 showed
+# the drone climbing ~5 m/s at 0.30 once stabilised level, so the level
+# hover throttle is actually closer to 0.27.
+HOVER_THROTTLE: float = 0.275
+
+# SMOKE 024 (2026-06-02b): altitude-hold on throttle.  At fixed 0.275 the
+# drone climbed ~2 m/s and orbited gate 0 from ~100 m above it, so it could
+# never thread the gate.  Close a proportional loop on (target_up − drone_up)
+# around the HOVER_THROTTLE baseline, clamped so a large altitude error can
+# only command a gentle descent rather than a free-fall.
+# SMOKE 050 (2026-06-02c): the course DESCENDS steeply (gate alts 0→−5→−14→
+# −25 m) and gates are only 2.72 m tall (±1.36 m tolerance).  At the old gains
+# the ±2 m altitude error overshot the hoop and the drone clipped the top bar
+# at gate 2.  Tightened the gain and dropped the throttle floor so it can
+# descend fast enough to stay inside the hoop on the steep legs.
+HOVER_KP_THROTTLE: float = 0.025  # throttle units per metre of altitude error
+HOVER_THROTTLE_MIN: float = 0.12
+HOVER_THROTTLE_MAX: float = 0.40
+
+# P-controller gain (rad/s per rad of attitude error) for the rate-mode
+# hover controller.  axis_sign_probe.py (2026-06-02) showed the sim
+# amplifies our commanded rate by ~2.4× (probably a built-in "rate gain"
+# in the Acro mode rate loop), so 1.0 here behaves like 2.4 in the sim.
+HOVER_KP_ATTITUDE: float = 1.0
+
+# Pitch target (rad) for the hover controller.  Smoke 017 (2026-06-02)
+# showed the drone obediently settles at the commanded pitch but moved in
+# the *opposite* direction to what we wanted because of the unusual
+# convention: positive ATTITUDE.pitch in this sim is nose-DOWN (confirmed
+# by IMU physics: at att.pitch=+17.8° the IMU reads accel=(-3.0, 0, -9.34)
+# which decomposes as -g·sin(17.8°) in body_x, characteristic of nose-down).
+# For forward thrust toward the active gate we want a small POSITIVE target.
+HOVER_PITCH_TARGET_RAD: float = +math.radians(5.0)  # SMOKE 022: nose-down, confirm yaw-sign model
+"""Tilt-angle clamp for the quaternion hover controller.  Beyond ~15° the
+small-angle ``tilt ≈ atan2(a, g)`` linearisation breaks down and the drone
+can run away laterally before the position term can pull it back."""
+
+# SMOKE 029 (2026-06-02c): distance taper to thread (not graze) the gate.
+# Smokes 026–028 showed odometry_velocity has no stable world-frame sign (a
+# clean closing approach read +v in one run and −v in another — likely a
+# body-frame quantity), so a velocity-based speed regulator is unreliable.
+# Instead taper the forward pitch by gate distance — only gate_dist_m is
+# trustworthy.  Far ⇒ full forward; within HOVER_SLOW_RADIUS the drone creeps
+# in slowly so its lateral miss shrinks below the gate radius and it threads,
+# instead of sailing ~3 m past the hoop and oscillating through the region.
+HOVER_SLOW_RADIUS: float = 14.0  # m; begin slowing the approach inside this
+HOVER_PITCH_MIN_FRAC: float = 0.3  # floor on the taper so it keeps creeping in
+
+# SMOKE 038 (2026-06-02c): lead-pursuit / proportional-navigation correction.
+# Smoke 037 proved pure pursuit (point nose at gate, drive forward) has a
+# stable circular orbit and never converges — it just shrinks with speed.  To
+# converge we steer the nose to CANCEL cross-track velocity: bias the heading
+# toward the side the drone is drifting so forward thrust kills the drift.
+# Uses finite-difference world velocity (position is trustworthy; odometry
+# velocity is frame-broken).  Sign of HOVER_KP_LEAD verified empirically.
+HOVER_KP_LEAD: float = 0.35  # rad of heading bias per (m/s) of cross-track vel
+HOVER_LEAD_MAX_RAD: float = math.radians(60.0)  # clamp on the bias
+
+# Gravitational acceleration used for tilt-from-acceleration conversion.
+_G: float = 9.81
+
 # VQ1 max run time (from spec)
 MAX_RUN_TIME_S = 8 * 60  # 8 minutes
+
+# SMOKE 030 (2026-06-02c): abort a run early once the drone strays this far
+# from its race-start position.  When the drone falls off the start platform
+# before the race goes live, the captured reference is corrupt and the drone
+# chases a phantom-distant gate clean out of the arena (observed flying 200–
+# 580 m before the sim froze the run).  A real VQ1 course leg is nowhere near
+# this far, so beyond MAX_EXCURSION_M we're certainly off-course — cut the run
+# and (with --auto-restart) Backspace straight into the next attempt.
+MAX_EXCURSION_M = 150.0
+
+# SMOKE 043 (2026-06-02c): a race counts as "live" for the whole 8 min after
+# its countdown, so if the sim is left running we connect and find a race that
+# started long ago — the drone has been drifting/fell off the platform with no
+# control, and handing off to it flies straight out of bounds.  Only hand
+# control to a FRESH race: one whose age (sim_boot − race_start) is small.
+# Otherwise keep Backspacing until a fresh countdown produces one.
+STALE_RACE_MS = 8000  # a live race older than this at first sight ⇒ stale
+STALE_RESTART_PERIOD_S = 3.0  # re-send Backspace at most this often
 
 # Minimum number of consolidated gate waypoints required before we attempt to
 # build a racing line and hand off from PID hover to MPCC tracking.  A closed
@@ -101,15 +183,10 @@ def _build_racing_line_from_waypoints(
     return build_racing_line(positions, orientations, planner_config, num_points=200, closed=closed)
 
 
-def _maybe_get_camera_frame(adapter: MAVSDKAdapter) -> tuple[np.ndarray, int] | None:
-    """Fetch the latest (frame, timestamp_ns) from the adapter if available.
-
-    The camera stream is not yet implemented in the adapter; this probes for a
-    ``latest_frame`` attribute so the pipeline works the moment vision lands
-    without further changes here.
-    """
-    frame = getattr(adapter, "latest_frame", None)
-    ts = getattr(adapter, "latest_frame_timestamp_ns", None)
+def _maybe_get_camera_frame(adapter: MAVLinkAdapter) -> tuple[np.ndarray, int] | None:
+    """Fetch the latest (frame, timestamp_ns) from the adapter if available."""
+    frame = adapter.latest_frame
+    ts = adapter.latest_frame_timestamp_ns
     if frame is None or ts is None:
         return None
     return frame, int(ts)
@@ -123,6 +200,7 @@ async def run_race(
     record_stride: int = 1,
     controller_type: str = "mpcc",
     rl_checkpoint: str | None = None,
+    auto_restart: bool = False,
 ) -> dict[str, object]:
     """Run the full autonomy pipeline against the real simulator.
 
@@ -158,10 +236,33 @@ async def run_race(
         config.mavlink.system_address = address
 
     # --- Connect to simulator ---
-    adapter = MAVSDKAdapter(config.mavlink)
+    adapter = MAVLinkAdapter(config.mavlink)
     await adapter.connect()
 
-    # Wait a moment for initial telemetry to arrive
+    # Start telemetry subscriptions BEFORE waiting/initialising so the snapshot
+    # carries real message timestamps when ESKF.initialise() reads it.  Without
+    # this ordering, telemetry.timestamp_ns is 0 and the first ESKF predict()
+    # treats the monotonic-clock IMU timestamp as a multi-million-second dt
+    # and the state explodes to ~10^12 m.
+    await adapter.start_offboard()
+
+    # With --auto-restart, send Backspace once at startup so the user can
+    # leave the sim focused indefinitely and we'll trigger a fresh race for
+    # each smoke run without them clicking anything.  Race-end auto-restart
+    # also still fires per the main-loop hook below.
+    if auto_restart:
+        try:
+            import keyboard
+
+            keyboard.send("backspace")
+            logger.info("auto-restart: sent Backspace at startup (sim window must be focused)")
+        except Exception:
+            logger.exception("auto-restart: failed to send startup Backspace")
+        # Give the sim time to consume the keystroke and start a fresh
+        # countdown before we begin probing race state.
+        await asyncio.sleep(3.0)
+
+    # Allow MAVLink + vision streams to populate the snapshot.
     logger.info("Waiting for initial telemetry...")
     await asyncio.sleep(1.0)
 
@@ -208,7 +309,7 @@ async def run_race(
     # De-dupe guard so we never record the same frame twice.
     last_recorded_ts: int | None = None
 
-    # Initialise ESKF from initial telemetry
+    # Initialise ESKF from initial telemetry (now carrying real timestamps).
     initial_telemetry = adapter.get_initial_telemetry()
     eskf.initialise(initial_telemetry)
     pid_controller.reset()
@@ -218,8 +319,40 @@ async def run_race(
         initial_telemetry.position,
     )
 
-    # --- Start offboard control ---
-    await adapter.start_offboard()
+    # Track whether we've seen race_started flip True yet.  The sim shows a
+    # "throttle down please" banner and refuses to start the race while we are
+    # sending non-zero thrust, so we must stream pure-idle commands during the
+    # countdown and only switch to the real controller once RACE_STATUS says
+    # the race is live.
+    race_was_started: bool = False
+
+    # Hover target captured the moment the race goes live.  Using a *fixed*
+    # target is essential — if we instead reused ``current_state.position`` as
+    # the PID setpoint each tick, the setpoint would drift with the drone and
+    # PID would see zero error while the drone flies off ballistically.
+    hover_setpoint_pos: np.ndarray | None = None
+    hover_setpoint_yaw_ned: float | None = None
+    """Yaw (in NED convention, radians) captured at race-live.  Used by the
+    ``hover`` controller as the fallback when no active gate is known."""
+
+    # Active-gate tracking for the steer-the-drift hover strategy.
+    last_active_gate_index: int = -1
+
+    # Latched True when the drone strays past MAX_EXCURSION_M; forces idle and
+    # (with --auto-restart) a Backspace, then clears when the race goes
+    # not-live so the next attempt re-arms cleanly.
+    excursion_aborted: bool = False
+
+    # Previous position/timestamp for finite-difference world velocity.
+    prev_pos: np.ndarray | None = None
+    prev_ts_ns: int | None = None
+
+    # Throttle for re-Backspacing when we've joined a stale (already-running)
+    # race.  0.0 ⇒ the first stale detection may Backspace immediately.
+    last_stale_restart_t: float = 0.0
+
+    # One-shot guard for dumping the gate-map course layout.
+    gate_map_dumped: bool = False
 
     # --- Main control loop ---
     command_period = 1.0 / config.mavlink.command_rate_hz
@@ -248,23 +381,60 @@ async def run_race(
             imu = adapter.latest_imu
             eskf.predict(imu)
 
+            # ESKF is currently bypassed for control: against the AI-GP sim
+            # ODOMETRY is ground-truth and there is no PnP loop to fuse, so
+            # leaving the ESKF in charge of `current_state` would only add a
+            # frame-conversion drift bug (see project_eskf_bypass memo).  We
+            # still run predict() so the state is available for log inspection
+            # and for the physical stage later, but the live pipeline reads the
+            # adapter's ODOMETRY-derived state directly.
+            current_state = adapter.latest_state
+
+            # Finite-difference world velocity from position.  The sim's
+            # odometry_velocity is in a non-standard rotated frame for the
+            # horizontal axes (smoke 037 offline check: |v| matched dP/dt but
+            # direction was uncorrelated), whereas position is ground-truth, so
+            # we derive a trustworthy world-frame velocity ourselves.
+            fd_world_vel: np.ndarray | None = None
+            if prev_pos is not None and prev_ts_ns is not None:
+                dt_fd = (current_state.timestamp_ns - prev_ts_ns) / 1e9
+                if dt_fd > 1e-3:
+                    fd_world_vel = (current_state.position - prev_pos) / dt_fd
+            prev_pos = current_state.position.copy()
+            prev_ts_ns = current_state.timestamp_ns
+
+            # One-shot dump of the course layout so we can reason about gate
+            # geometry (turns, altitude changes, hoop sizes, facing) offline.
+            if not gate_map_dumped and adapter.gate_map:
+                gate_map_dumped = True
+                for g in adapter.gate_map:
+                    gn, ge, gd = g.position_ned
+                    logger.info(
+                        "GATEMAP id=%d pos_ned=(%.1f,%.1f,%.1f) alt_up=%.1f "
+                        "wxyz=(%.3f,%.3f,%.3f,%.3f) w=%.2f h=%.2f",
+                        g.gate_id,
+                        gn,
+                        ge,
+                        gd,
+                        -gd,
+                        *g.orientation_ned_wxyz,
+                        g.width_m,
+                        g.height_m,
+                    )
+
             # --- Vision pipeline ---
-            # The MAVSDK adapter does not yet expose camera frames; _maybe_get_
-            # camera_frame returns None until the vision stream lands.  When it
-            # does, detector → tracker → gate_mapper runs automatically.
             frame_info = _maybe_get_camera_frame(adapter)
             tracked: list[GateDetection] = []
             if frame_info is not None:
                 frame, frame_ts_ns = frame_info
                 raw_detections = detector.detect(frame, frame_ts_ns)
                 tracked = tracker.update(raw_detections)
-                mapper.observe_many(tracked, eskf.state)
+                mapper.observe_many(tracked, current_state)
                 if recorder is not None and frame_ts_ns != last_recorded_ts:
-                    recorder.record(frame, frame_ts_ns, eskf.state, tracked)
+                    recorder.record(frame, frame_ts_ns, current_state, tracked)
                     last_recorded_ts = frame_ts_ns
 
             # --- Planning + Control ---
-            current_state = eskf.state
 
             # Build / rebuild the racing line once we have enough consolidated
             # gate waypoints.  Rebuilding each frame is cheap relative to MPCC,
@@ -341,17 +511,315 @@ async def run_race(
                     racing_line = None
 
             if cmd is None:
-                # PID hover baseline (and fallback while gates are being mapped).
+                # PID hover baseline: hold the fixed take-off position (set
+                # the moment the race went live).  Pre-race we have nothing to
+                # hold yet — fall back to the current position so the PID has
+                # a valid setpoint to compute against (the command is about to
+                # be overridden to idle anyway).
+                target_pos = (
+                    hover_setpoint_pos if hover_setpoint_pos is not None else current_state.position
+                )
                 setpoint = TrajectorySetpoint(
-                    position=current_state.position,
+                    position=target_pos,
                     yaw=0.0,
                 )
                 cmd = pid_controller.update(current_state, setpoint)
 
+            # Race-start gate: override every command to idle until the sim
+            # reports the race has gone live (green light).  ``race_started``
+            # flips True the moment the user clicks Race (countdown begins),
+            # but applying throttle during the countdown DQs the run, so we
+            # gate on ``is_live`` which only fires after the countdown ends.
+            rs = adapter.race_status
+            race_live = rs is not None and rs.is_live
+
+            # Active-gate transition logging: when active_gate_index advances,
+            # we've just passed a gate (the only success signal we have).
+            if rs is not None and race_live and rs.active_gate_index != last_active_gate_index:
+                if last_active_gate_index >= 0:
+                    logger.info(
+                        "GATE PASSED — now targeting gate %d (was %d), t=%.1fs",
+                        rs.active_gate_index,
+                        last_active_gate_index,
+                        elapsed,
+                    )
+                last_active_gate_index = rs.active_gate_index
+
+            # Re-arm the start-transition on race end so the next Restart
+            # captures a fresh hover target and resets PID integrator state.
+            if rs is not None and rs.race_finished:
+                if race_was_started and auto_restart:
+                    # Only fire the keystroke on the transition into finished,
+                    # so we don't spam Backspace once per tick.
+                    try:
+                        import keyboard
+
+                        keyboard.send("backspace")
+                        logger.info("auto-restart: race finished, sent Backspace to sim")
+                    except Exception:
+                        logger.exception("auto-restart: failed to send Backspace")
+                race_was_started = False
+                hover_setpoint_pos = None
+                hover_setpoint_yaw_ned = None
+
+            # Far-excursion cutout: if the drone has strayed past
+            # MAX_EXCURSION_M from its race-start position, the run is
+            # off-course (usually a bad platform start) — abort early and
+            # restart instead of waiting for the out-of-bounds freeze.
+            if race_live and hover_setpoint_pos is not None and not excursion_aborted:
+                excursion = float(np.linalg.norm(current_state.position - hover_setpoint_pos))
+                if excursion > MAX_EXCURSION_M:
+                    logger.warning(
+                        "Excursion %.0f m > %.0f m from start — off course, aborting run early.",
+                        excursion,
+                        MAX_EXCURSION_M,
+                    )
+                    excursion_aborted = True
+                    race_was_started = False
+                    hover_setpoint_pos = None
+                    hover_setpoint_yaw_ned = None
+                    if auto_restart:
+                        try:
+                            import keyboard
+
+                            keyboard.send("backspace")
+                            logger.info("auto-restart: excursion abort, sent Backspace to sim")
+                        except Exception:
+                            logger.exception("auto-restart: failed to send Backspace")
+
+            # Stale-race guard: a race reads "live" for its whole 8 min, so if
+            # we connected to one that started long ago the drone has been
+            # uncontrolled (drifted / fell off the platform).  Refuse to hand
+            # off to it and Backspace until a FRESH race (small age) appears.
+            joined_stale = False
+            if race_live and not race_was_started and rs is not None:
+                race_age_ms = rs.sim_boot_time_ms - rs.race_start_boot_time_ms
+                if race_age_ms > STALE_RACE_MS:
+                    joined_stale = True
+                    now_m = time.monotonic()
+                    if auto_restart and now_m - last_stale_restart_t > STALE_RESTART_PERIOD_S:
+                        last_stale_restart_t = now_m
+                        try:
+                            import keyboard
+
+                            keyboard.send("backspace")
+                            logger.warning(
+                                "Joined stale race (age %.0fs) — Backspacing for a fresh start.",
+                                race_age_ms / 1000.0,
+                            )
+                        except Exception:
+                            logger.exception("auto-restart: failed to send Backspace")
+
+            if not race_live:
+                excursion_aborted = False
+            if not race_live or excursion_aborted or joined_stale:
+                cmd = DroneCommand(
+                    timestamp_ns=cmd.timestamp_ns,
+                    throttle=0.0,
+                    roll_rate=0.0,
+                    pitch_rate=0.0,
+                    yaw_rate=0.0,
+                )
+            elif not race_was_started:
+                # Transition pre-race → live: clear PID integrator state so we
+                # don't kick from any wind-up that accumulated during idle, and
+                # capture the take-off pose as a fixed hover target.
+                pid_controller.reset()
+                hover_setpoint_pos = current_state.position.copy()
+                hover_setpoint_yaw_ned = float(adapter.telemetry.attitude_yaw)
+                race_was_started = True
+                logger.info(
+                    "Race started — handing control to %s (active_gate=%d) "
+                    "hover_target=%s yaw=%.1f°",
+                    controller_type.upper(),
+                    rs.active_gate_index,
+                    np.array2string(hover_setpoint_pos, precision=2),
+                    np.degrees(hover_setpoint_yaw_ned),
+                )
+
             cmd = rate_limiter.limit(cmd)
 
             # --- Send command ---
-            await adapter.send_command(cmd)
+            # Three send paths depending on controller_type:
+            #   - position : SET_POSITION_TARGET_LOCAL_NED with active gate
+            #                (currently broken — see project_session memo)
+            #   - hover    : SET_ATTITUDE_TARGET in quaternion mode targeting
+            #                "level at captured yaw" + measured hover throttle
+            #   - pid/mpcc/rl : rate-mode SET_ATTITUDE_TARGET (existing path)
+            # Pre-race for every mode we send the idle rate-mode command so
+            # the throttle-down banner stays satisfied.
+            alt_message_sent = False
+            if race_live and not excursion_aborted and not joined_stale:
+                if controller_type == "position":
+                    rs = adapter.race_status
+                    gates = adapter.gate_map
+                    if rs is not None and gates:
+                        gate_idx = rs.active_gate_index
+                        if 0 <= gate_idx < len(gates):
+                            gate = gates[gate_idx]
+                            n, e, d = gate.position_ned
+                            await adapter.send_position_command(
+                                north=n, east=e, down=d, yaw_deg=0.0
+                            )
+                            alt_message_sent = True
+                elif controller_type == "hover" and hover_setpoint_yaw_ned is not None:
+                    # Rate-mode hover for Acro mode (smoke 013, 2026-06-02).
+                    # Quaternion mode produced uncontrolled yaw spin (smokes
+                    # 010/011/012); Acro is a body-rate flight mode and the
+                    # sim ignores the quaternion field, so we close the
+                    # attitude loop ourselves.  Yaw target points at the
+                    # active gate so the steered forward thrust carries us
+                    # toward it; pitch and roll targets are zero (level).
+                    # SMOKE 023 (2026-06-02b): gate steering RE-ENABLED with the
+                    # CORRECTED yaw sign.  Smokes 019–022 proved the sim reports
+                    # ATTITUDE.yaw with the OPPOSITE sign to standard NED (yaw is
+                    # +CCW / ENU-style, same non-standard family as
+                    # positive-pitch=nose-down).  The drone's nose points at
+                    # heading (cosθ, −sinθ), i.e. heading = −θ.  So to face a
+                    # bearing atan2(de, dn) we must command target = atan2(−de,
+                    # dn).  gate_dist_m logged below validates we're closing in.
+                    target_yaw_ned = hover_setpoint_yaw_ned
+                    gate_dist_m = float("nan")
+                    drone_up = float(current_state.position[2])
+                    # Default: hold current altitude (zero correction).
+                    target_up = drone_up
+                    # Closing speed toward the gate (m/s); 0 ⇒ full forward cmd.
+                    v_close = 0.0
+                    rs = adapter.race_status
+                    gates = adapter.gate_map
+                    if rs is not None and gates and 0 <= rs.active_gate_index < len(gates):
+                        gate = gates[rs.active_gate_index]
+                        gate_n, gate_e, gate_d = gate.position_ned
+                        # Drone position in NED: ENU x→NED-east, ENU y→NED-north.
+                        drone_n = float(current_state.position[1])
+                        drone_e = float(current_state.position[0])
+                        dn = gate_n - drone_n
+                        de = gate_e - drone_e
+                        gate_dist_m = math.hypot(dn, de)
+                        # Gate altitude in ENU-up = −(NED down).
+                        target_up = -gate_d
+                        if gate_dist_m > 1e-3:
+                            # Closing speed = horizontal velocity projected onto
+                            # the unit vector toward the gate.  ENU velocity:
+                            # [0]=East, [1]=North; (de,dn) are East/North diffs.
+                            # Positive ⇒ approaching.  (Smoke 027's clean 193 m
+                            # approach confirmed this sign; smoke 026's apparent
+                            # inversion was the launch transient dominating a
+                            # short 21 m approach, not a frame flip.)
+                            vel = current_state.velocity
+                            v_close = (float(vel[0]) * de + float(vel[1]) * dn) / gate_dist_m
+                        if dn * dn + de * de > 1.0:
+                            # Negated yaw sign — see comment above.
+                            base_yaw = math.atan2(-de, dn)
+                            # Lead-pursuit: bias the heading to cancel cross-
+                            # track velocity so we converge instead of orbit.
+                            # Cross-track unit (E,N) = +90° rotate of the
+                            # gate-bearing unit = (−dn, de)/dist.
+                            lead = 0.0
+                            if fd_world_vel is not None:
+                                v_cross = (
+                                    float(fd_world_vel[0]) * (-dn) + float(fd_world_vel[1]) * de
+                                ) / gate_dist_m
+                                lead = float(
+                                    np.clip(
+                                        HOVER_KP_LEAD * v_cross,
+                                        -HOVER_LEAD_MAX_RAD,
+                                        HOVER_LEAD_MAX_RAD,
+                                    )
+                                )
+                            target_yaw_ned = base_yaw - lead
+
+                    hover_throttle = float(
+                        np.clip(
+                            HOVER_THROTTLE + HOVER_KP_THROTTLE * (target_up - drone_up),
+                            HOVER_THROTTLE_MIN,
+                            HOVER_THROTTLE_MAX,
+                        )
+                    )
+
+                    # Read attitude in NED from the adapter (raw MAVLink
+                    # ATTITUDE values, aerospace convention).
+                    t_att = adapter.telemetry
+                    roll_now = float(t_att.attitude_roll)
+                    pitch_now = float(t_att.attitude_pitch)
+                    yaw_now = float(t_att.attitude_yaw)
+
+                    # Wrap the yaw error to (−π, π] so we always rotate the
+                    # short way around.
+                    yaw_err = (target_yaw_ned - yaw_now + math.pi) % (2.0 * math.pi) - math.pi
+
+                    # SMOKE 025/029 (2026-06-02c): break the pure-pursuit orbit
+                    # with two terms.
+                    #  (1) Alignment gate max(0, cos(yaw_err)): forward thrust
+                    #      only when pointed at the gate, ~0 while the bearing
+                    #      swings, so the drone coasts and lets yaw catch up
+                    #      instead of looping (smoke 025).
+                    #  (2) Distance taper: scale forward pitch down inside
+                    #      HOVER_SLOW_RADIUS so the drone creeps the last metres
+                    #      and threads the hoop instead of sailing past it
+                    #      (smoke 029).
+                    align = max(0.0, math.cos(yaw_err))
+                    dist_taper = (
+                        1.0
+                        if math.isnan(gate_dist_m)
+                        else float(
+                            np.clip(
+                                gate_dist_m / HOVER_SLOW_RADIUS,
+                                HOVER_PITCH_MIN_FRAC,
+                                1.0,
+                            )
+                        )
+                    )
+                    pitch_target_eff = HOVER_PITCH_TARGET_RAD * align * dist_taper
+
+                    # Override the cmd computed upstream (PID hover fallback);
+                    # rate-mode send_command picks this up below.  Sign
+                    # conventions confirmed by axis_sign_probe.py 2026-06-02:
+                    #   roll: aerospace  (positive rate → angle increases)
+                    #   pitch: RH-rule   (positive rate → angle DECREASES)
+                    #   yaw:   RH-rule   (positive rate → angle DECREASES)
+                    # To drive each angle toward target=0 (or yaw toward
+                    # target_yaw_ned) we pick the sign that produces an
+                    # angle-change-toward-target with these conventions.
+                    # We do NOT re-apply ``rate_limiter`` here — the upstream
+                    # limit() call already updated its stored previous-cmd
+                    # to whatever PID produced on this tick, and on tick 1
+                    # the rate-of-change clamp would suppress our override.
+                    # Our controller already produces bounded rates
+                    # (|rate| ≤ KP·π ≈ 3 rad/s, well under sim limits).
+                    cmd = DroneCommand(
+                        timestamp_ns=current_state.timestamp_ns,
+                        throttle=hover_throttle,
+                        roll_rate=-HOVER_KP_ATTITUDE * roll_now,
+                        pitch_rate=+HOVER_KP_ATTITUDE * (pitch_now - pitch_target_eff),
+                        yaw_rate=-HOVER_KP_ATTITUDE * yaw_err,
+                    )
+                    # Verbose hover-controller log every 1 s so we can verify
+                    # the yaw-toward-gate logic is actually computing what we
+                    # expect (smoke 015 saw yaw stuck at 52° while target was
+                    # -142° toward gate 0 — need to confirm command is sent).
+                    if loop_count % int(config.mavlink.command_rate_hz) == 0:
+                        logger.info(
+                            "HOVER cmd: throttle=%.3f roll_rate=%+.3f "
+                            "pitch_rate=%+.3f yaw_rate=%+.3f | "
+                            "target_yaw=%+.1f° yaw_now=%+.1f° yaw_err=%+.1f° "
+                            "| gate_idx=%d gate_dist=%.1fm dz=%+.1fm vc=%+.1f gate_map_size=%d",
+                            cmd.throttle,
+                            cmd.roll_rate,
+                            cmd.pitch_rate,
+                            cmd.yaw_rate,
+                            np.degrees(target_yaw_ned),
+                            np.degrees(yaw_now),
+                            np.degrees(yaw_err),
+                            rs.active_gate_index if rs is not None else -1,
+                            gate_dist_m,
+                            target_up - drone_up,
+                            v_close,
+                            len(adapter.gate_map),
+                        )
+
+            if not alt_message_sent:
+                await adapter.send_command(cmd)
 
             # --- Logging ---
             flight_log.log_state(current_state)
@@ -360,12 +828,30 @@ async def run_race(
             # Periodic diagnostics (every 5s)
             if loop_count % int(5 * config.mavlink.command_rate_hz) == 0:
                 t = adapter.telemetry
-                mode = "MPCC" if mpcc is not None else "HOVER"
+                if not race_live:
+                    mode = "IDLE"
+                elif controller_type == "position":
+                    mode = "POS"
+                elif controller_type == "hover":
+                    mode = "QHOVER"
+                elif mpcc is not None:
+                    mode = "MPCC"
+                else:
+                    mode = "HOVER"
+                rs_for_log = adapter.race_status
+                race_info = (
+                    f"start={rs_for_log.race_start_boot_time_ms}ms "
+                    f"now={rs_for_log.sim_boot_time_ms}ms "
+                    f"gate={rs_for_log.active_gate_index}"
+                    if rs_for_log is not None
+                    else "no_status"
+                )
                 logger.info(
-                    "DIAG t=%.1fs | mode=%s | mapped_gates=%d | odom_valid=%s | "
-                    "pos=%s | att=(%.1f, %.1f, %.1f)°",
+                    "DIAG t=%.1fs | mode=%s | race=%s | mapped_gates=%d | "
+                    "odom_valid=%s | pos=%s | att=(%.1f, %.1f, %.1f)°",
                     elapsed,
                     mode,
+                    race_info,
                     len(mapper.waypoints()),
                     t.odometry_valid,
                     np.array2string(t.odometry_position, precision=2),
@@ -441,14 +927,34 @@ def main() -> None:
         "--controller",
         type=str,
         default="mpcc",
-        choices=["pid", "mpcc", "rl"],
-        help="Controller type: mpcc (default), pid, or rl",
+        choices=["pid", "mpcc", "rl", "position", "hover"],
+        help=(
+            "Controller type. "
+            "'mpcc' (default) and 'pid'/'rl' are rate-mode (currently tumble "
+            "the drone — see project_pid_real_sim_todo memo). "
+            "'position' sends SET_POSITION_TARGET_LOCAL_NED at the active gate "
+            "(sim ignores it — see session memo). "
+            "'hover' streams SET_ATTITUDE_TARGET in quaternion mode targeting "
+            "'level at take-off yaw' + measured hover throttle — uses the "
+            "sim's internal stabiliser so we don't fight the FRD/FLU "
+            "body-frame confusion in our PID."
+        ),
     )
     parser.add_argument(
         "--rl-checkpoint",
         type=str,
         default=None,
         help="Path to SB3 model .zip (required when --controller rl)",
+    )
+    parser.add_argument(
+        "--auto-restart",
+        action="store_true",
+        help=(
+            "Send Backspace to the sim window when a race finishes (DQ, time-out, "
+            "or completion) to trigger an automatic restart.  Use to iterate "
+            "smoke runs without manually clicking between attempts.  Requires "
+            "the sim window to be focused for the keystroke to register."
+        ),
     )
     args = parser.parse_args()
 
@@ -470,6 +976,7 @@ def main() -> None:
             record_stride=args.record_stride,
             controller_type=args.controller,
             rl_checkpoint=args.rl_checkpoint,
+            auto_restart=args.auto_restart,
         )
     )
 

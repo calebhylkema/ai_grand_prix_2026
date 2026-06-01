@@ -13,7 +13,9 @@ class TestLoadConfig:
     def test_loads_default(self) -> None:
         cfg = load_config()
         assert cfg.estimation.imu_rate_hz == 200.0
-        assert cfg.camera.width == 1280
+        # Sim ships 640x360 JPEG frames (confirmed against AI-GP sim 2026-06-01).
+        assert cfg.camera.width == 640
+        assert cfg.camera.height == 360
         assert cfg.gate.width_m == 1.5
 
     def test_raw_dict_populated(self) -> None:

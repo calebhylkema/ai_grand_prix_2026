@@ -350,20 +350,27 @@ class PlannerConfig:
 
 @dataclass(slots=True)
 class MAVLinkConfig:
-    """MAVSDK / MAVLink connection parameters, read from [mavlink] in config TOML."""
+    """MAVLink connection parameters, read from [mavlink] in config TOML."""
 
-    system_address: str = "udp://:14540"
-    """MAVSDK connection string (UDP endpoint the simulator listens on)."""
+    system_address: str = "udpin:127.0.0.1:14550"
+    """pymavlink connection string. Default matches the AI-GP simulator's
+    PyAIPilotExample (udpin:IP:PORT = we listen, sim connects to us)."""
 
     command_rate_hz: float = 50.0
     """Rate at which to send attitude commands (Hz). Spec recommends 50–120."""
 
     heartbeat_rate_hz: float = 2.0
-    """Minimum heartbeat rate (Hz). Spec minimum is 2 Hz."""
+    """Heartbeat send rate (Hz). Spec minimum is 2 Hz."""
 
     coordinate_frame: str = "ned"
     """Simulator coordinate frame. MAVLink default is NED."""
 
     offboard_mode: str = "attitude_rate"
-    """Offboard control mode: 'attitude_rate' (SET_ATTITUDE_TARGET with body rates)
+    """Control mode: 'attitude_rate' (SET_ATTITUDE_TARGET with body rates)
     or 'position' (SET_POSITION_TARGET_LOCAL_NED)."""
+
+    vision_bind_ip: str = "0.0.0.0"
+    """Local bind IP for the vision UDP receiver."""
+
+    vision_port: int = 5600
+    """UDP port the sim sends camera frames to (see PyAIPilotExample/vision_rx.py)."""

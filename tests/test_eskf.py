@@ -85,6 +85,71 @@ def _make_imu(
 # ---------------------------------------------------------------------------
 
 
+class TestFirstStepGuard:
+    """Regression: ESKF must not explode when initialise() got a zero timestamp.
+
+    Real-world cause: the MAVLink adapter's telemetry snapshot starts with
+    timestamp_ns = 0 until the rx thread receives its first message; if
+    ``initialise()`` runs before that, ``state.timestamp_ns`` is 0 and the
+    first IMU sample (with a monotonic-clock timestamp of ~10^15 ns) would be
+    integrated as a ``dt`` of ~10^6 seconds — blowing the position up to ~10^12
+    metres (observed 2026-06-01 against the real sim).
+    """
+
+    def test_first_imu_with_huge_timestamp_does_not_diverge(self, config) -> None:
+        filt = ESKF(config)
+        filt.initialise(
+            Telemetry(
+                timestamp_ns=0,  # snapshot default — the real-world bug trigger
+                position=np.zeros(3),
+                velocity=np.zeros(3),
+                orientation=quat_identity(),
+            )
+        )
+        # Realistic monotonic-clock timestamp for an 18-min-uptime sim.
+        t0 = 1_080_000_000_000_000
+        filt.predict(_stationary_imu(t0))
+
+        # First call must anchor t0 and leave the state at origin.
+        assert filt.state.timestamp_ns == t0
+        assert_allclose(filt.state.position, np.zeros(3), atol=1e-9)
+        assert_allclose(filt.state.velocity, np.zeros(3), atol=1e-9)
+
+    def test_second_step_integrates_normally(self, config) -> None:
+        filt = ESKF(config)
+        filt.initialise(
+            Telemetry(
+                timestamp_ns=0,
+                position=np.zeros(3),
+                velocity=np.zeros(3),
+                orientation=quat_identity(),
+            )
+        )
+        t0 = 1_000_000_000_000
+        # First sample: anchors t0, no integration.
+        filt.predict(_stationary_imu(t0))
+        # Second sample 5 ms later with stationary IMU: gravity should cancel.
+        filt.predict(_stationary_imu(t0 + 5_000_000))
+
+        assert_allclose(filt.state.position, np.zeros(3), atol=1e-6)
+        assert_allclose(filt.state.velocity, np.zeros(3), atol=1e-6)
+        assert filt.state.timestamp_ns == t0 + 5_000_000
+
+    def test_giant_dt_step_skipped(self, eskf) -> None:
+        """A single IMU step beyond the dt cap is dropped, not integrated."""
+        # Anchor t0 with a normal step.
+        eskf.predict(_stationary_imu(5_000_000))
+        eskf.predict(_stationary_imu(10_000_000))
+        pos_before = eskf.state.position.copy()
+
+        # Now jump 5 seconds forward (above _MAX_IMU_DT_S = 0.5s).
+        eskf.predict(_stationary_imu(10_000_000 + 5_000_000_000))
+
+        # State must stay at the previous position; only t0 is updated.
+        assert_allclose(eskf.state.position, pos_before, atol=1e-9)
+        assert eskf.state.timestamp_ns == 10_000_000 + 5_000_000_000
+
+
 class TestInitialisation:
     """ESKF init and state after initialise()."""
 

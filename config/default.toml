@@ -28,13 +28,16 @@ corners_3d = [
 ]
 
 [camera]
-# Placeholder intrinsics — recalibrate with actual hardware
-fx = 600.0
-fy = 600.0
-cx = 640.0  # assuming 1280px wide
-cy = 360.0  # assuming 720px tall
-width = 1280
-height = 720
+# Sim ships 640x360 JPEG frames (confirmed by smoke test 2026-06-01, frame 800).
+# fx/fy are still placeholders pending calibration from a known-distance gate.
+# Rough rule of thumb for FPV: HFOV ~90-120deg -> fx in [185, 320] at width=640.
+# 300 is a reasonable mid-range starting point until we calibrate.
+fx = 300.0
+fy = 300.0
+cx = 320.0  # principal point: image centre, width/2
+cy = 180.0  # height/2
+width = 640
+height = 360
 distortion = [0.0, 0.0, 0.0, 0.0, 0.0]  # k1, k2, p1, p2, k3
 
 # Camera-to-body extrinsic (FPV camera tilted ~15° forward)
@@ -58,7 +61,10 @@ position_ki = [0.0, 0.0, 0.1]
 position_kd = [1.5, 1.5, 2.0]
 
 velocity_kp = [4.0, 4.0, 5.0]
-attitude_kp = [8.0, 8.0, 4.0]
+# attitude_kp cut from [8, 8, 4] to [3, 3, 1.5] 2026-06-02 — mock-sim gains
+# tumbled the drone on the real sim by overcommanding rate corrections.
+# Conservative first cut; we'll iterate from here.
+attitude_kp = [3.0, 3.0, 1.5]
 rate_kp = [12.0, 12.0, 6.0]
 
 # Physical limits
@@ -83,12 +89,15 @@ gate_approach_offset_m = 2.0  # waypoint distance before/after each gate
 max_velocity_mps = 25.0       # conservative starting limit
 
 [mavlink]
-# MAVSDK connection parameters (for real simulator)
-system_address = "udp://:14540"     # UDP endpoint for MAVLink
-command_rate_hz = 50.0              # Attitude command send rate (spec: 50–120 Hz)
-heartbeat_rate_hz = 2.0             # Minimum heartbeat rate (spec: 2 Hz minimum)
-coordinate_frame = "ned"            # MAVLink uses NED internally
-offboard_mode = "attitude_rate"     # "attitude_rate" or "position"
+# pymavlink connection parameters (for real AI-GP simulator).
+# Sim sends MAVLink to UDP 14550 and vision JPEGs to UDP 5600 (per PyAIPilotExample).
+system_address = "udpin:127.0.0.1:14550"   # pymavlink connection string (we listen)
+command_rate_hz = 50.0                     # Attitude command send rate (spec: 50–120 Hz)
+heartbeat_rate_hz = 2.0                    # Heartbeat send rate (spec: 2 Hz minimum)
+coordinate_frame = "ned"                   # MAVLink uses NED internally
+offboard_mode = "attitude_rate"            # "attitude_rate" or "position"
+vision_bind_ip = "0.0.0.0"                 # Bind IP for vision UDP socket
+vision_port = 5600                         # Sim's camera-frame UDP port
 
 [perception]
 # Detector selection: "classical" or "neural"

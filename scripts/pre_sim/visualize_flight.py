@@ -26,7 +26,7 @@ import numpy as np
 from matplotlib.collections import LineCollection
 
 # Ensure project root is on path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 def load_flight_log(path: Path) -> dict[str, np.ndarray]:
@@ -449,8 +449,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.run:
-        from drone_racing.utils.config import load_config
         from scripts.run_sim import run_pipeline
+
+        from drone_racing.utils.config import load_config
 
         config = load_config()
         import logging

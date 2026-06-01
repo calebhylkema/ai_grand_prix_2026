@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
 from drone_racing.planning.spline import build_racing_line

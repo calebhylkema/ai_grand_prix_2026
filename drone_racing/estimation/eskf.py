@@ -57,6 +57,11 @@ _BG = slice(12, 15)  # gyro bias error
 
 _STATE_DIM = 15
 
+# A single IMU step longer than this is treated as a clock anomaly (first
+# sample after init, lost stream, monotonic reset) — we drop the step and
+# re-anchor t0 instead of integrating, to avoid catastrophic state explosion.
+_MAX_IMU_DT_S = 0.5
+
 
 @dataclass(slots=True)
 class _StateSnapshot:
@@ -168,8 +173,28 @@ class ESKF:
             logger.warning("predict() called before initialise(); ignoring")
             return self._state
 
+        # First IMU sample after initialise(): if the initial telemetry didn't
+        # carry a real timestamp (snapshot defaulted to 0), establish t0 from
+        # this sample. Without this guard, the first dt would equal the entire
+        # monotonic clock value and blow the state up to ~10^12 m.
+        if self._state.timestamp_ns == 0:
+            self._state.timestamp_ns = imu.timestamp_ns
+            return self._state
+
         dt = self._dt_from_last(imu.timestamp_ns)
         if dt <= 0.0:
+            return self._state
+
+        # Defensive clamp — a giant dt means lost samples, a clock reset, or
+        # the first IMU after a stall. Drop the step and reset t0 so the next
+        # sample picks up at a sane delta instead of integrating over minutes.
+        if dt > _MAX_IMU_DT_S:
+            logger.warning(
+                "ESKF: skipping IMU step with dt=%.3fs (> %.2fs cap) — resetting t0",
+                dt,
+                _MAX_IMU_DT_S,
+            )
+            self._state.timestamp_ns = imu.timestamp_ns
             return self._state
 
         # Snapshot state *before* this IMU sample is integrated
@@ -653,8 +678,19 @@ class ESKF:
             IMU samples to replay, in chronological order.
         """
         for entry in imu_entries:
+            if self._state.timestamp_ns == 0:
+                self._state.timestamp_ns = entry.timestamp_ns
+                continue
             dt = self._dt_from_last(entry.timestamp_ns)
             if dt <= 0.0:
+                continue
+            if dt > _MAX_IMU_DT_S:
+                logger.warning(
+                    "ESKF: skipping replayed IMU with dt=%.3fs (> %.2fs cap)",
+                    dt,
+                    _MAX_IMU_DT_S,
+                )
+                self._state.timestamp_ns = entry.timestamp_ns
                 continue
 
             # Bias-corrected measurements

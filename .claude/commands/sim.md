@@ -5,7 +5,7 @@ allowed-tools:
   - Read
 ---
 
-Launch the simulator with: `uv run python scripts/run_sim.py --config config/default.toml`
+Launch the simulator with: `uv run python scripts/pre_sim/run_sim.py --config config/default.toml`
 
 After the run completes, analyze the flight log:
 1. Did the drone complete the course? If not, where did it fail?

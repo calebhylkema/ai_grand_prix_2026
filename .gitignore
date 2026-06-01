@@ -53,3 +53,7 @@ CLAUDE.local.md
 # Competition credentials
 .env
 *.key
+
+# Simulator install + capture artifacts (large / local)
+SIMULATOR/
+start_frame.png

@@ -33,10 +33,12 @@ logger = logging.getLogger(__name__)
 # Gravity magnitude (m/s²)
 _G = 9.81
 
-# Hover throttle approximation (normalised) — the throttle needed to
-# counteract gravity when the drone is level.  Will need tuning once we
-# have the real mass / thrust curve.
-_HOVER_THROTTLE = 0.5
+# Hover throttle (normalised) — the throttle that produces vertical
+# acceleration equal to gravity when the drone is level.  Measured against
+# the AI-GP sim 2026-06-02 via ``scripts/hover_probe.py``: at throttle=0.40
+# and pitch=17.8° nose-down the drone accelerated upward at ~2.5 m/s², which
+# back-solves to a level hover throttle of ~0.30.  See [[sim_drop_findings]].
+_HOVER_THROTTLE = 0.30
 
 
 # ---------------------------------------------------------------------------
