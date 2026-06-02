@@ -66,7 +66,12 @@ HOVER_THROTTLE: float = 0.275
 # the ±2 m altitude error overshot the hoop and the drone clipped the top bar
 # at gate 2.  Tightened the gain and dropped the throttle floor so it can
 # descend fast enough to stay inside the hoop on the steep legs.
-HOVER_KP_THROTTLE: float = 0.025  # throttle units per metre of altitude error
+# SMOKE 057 (2026-06-02c): P-only altitude was underdamped — on the steep
+# gate-to-gate descents it stooped hard then overshot back up, oscillating and
+# missing the next gate.  Add a derivative term on vertical velocity (from the
+# trustworthy finite-diff Z) to damp the descent and kill the overshoot.
+HOVER_KP_THROTTLE: float = 0.02  # throttle units per metre of altitude error
+HOVER_KD_THROTTLE: float = 0.05  # throttle units per (m/s) of vertical velocity
 HOVER_THROTTLE_MIN: float = 0.12
 HOVER_THROTTLE_MAX: float = 0.40
 
@@ -106,8 +111,32 @@ HOVER_PITCH_MIN_FRAC: float = 0.3  # floor on the taper so it keeps creeping in
 # toward the side the drone is drifting so forward thrust kills the drift.
 # Uses finite-difference world velocity (position is trustworthy; odometry
 # velocity is frame-broken).  Sign of HOVER_KP_LEAD verified empirically.
-HOVER_KP_LEAD: float = 0.35  # rad of heading bias per (m/s) of cross-track vel
-HOVER_LEAD_MAX_RAD: float = math.radians(60.0)  # clamp on the bias
+HOVER_KP_LEAD: float = 0.3  # rad of heading bias per (m/s) of cross-track vel
+HOVER_LEAD_MAX_RAD: float = math.radians(45.0)  # clamp on the bias
+
+# SMOKE 059 (2026-06-02c): roll-based cross-track control.  Analysis of the
+# alternating left/right gate clips showed lateral motion was 100% yaw-driven
+# (roll held at 0), which lags and oscillates ±10 m.  Use ROLL to translate
+# sideways toward the gate's lateral (East) line directly — a PD on the East
+# offset + East velocity — and back off the yaw-lead so the two don't fight.
+# Course runs ~straight in North so body-Y ≈ East; the world→body roll SIGN is
+# unverified in this non-standard sim, so it's a flag to flip empirically.
+HOVER_KP_ROLL: float = 0.05  # rad of roll per metre of lateral (East) offset
+HOVER_KD_ROLL: float = 0.08  # rad of roll per (m/s) of lateral velocity
+HOVER_ROLL_CLAMP_RAD: float = math.radians(12.0)  # bound on roll target
+# Smoke 059 with +1.0 DIVERGED (East ran to +14 m, wrong way) — classic
+# wrong-sign positive feedback, so the world→body roll sign is flipped here.
+HOVER_ROLL_SIGN: float = -1.0
+
+# SMOKE 054 (2026-06-02c): freeze the heading once very close to the gate.
+# At close range the bearing to the gate whips around as the drone moves
+# laterally, so the yaw target chases it and the drone spins in place instead
+# of crossing the plane (smoke 053 at gate 2).  Once inside HOVER_COMMIT_RADIUS
+# we lock the (lead-corrected) heading captured on entry and fly straight
+# through; release only beyond HOVER_COMMIT_RELEASE so a wobble can't unlock.
+# Pitch/taper are left alone (no full-forward punch — that overshot in 035).
+HOVER_COMMIT_RADIUS: float = 10.0
+HOVER_COMMIT_RELEASE: float = 12.0
 
 # Gravitational acceleration used for tilt-from-acceleration conversion.
 _G: float = 9.81
@@ -122,7 +151,29 @@ MAX_RUN_TIME_S = 8 * 60  # 8 minutes
 # 580 m before the sim froze the run).  A real VQ1 course leg is nowhere near
 # this far, so beyond MAX_EXCURSION_M we're certainly off-course — cut the run
 # and (with --auto-restart) Backspace straight into the next attempt.
-MAX_EXCURSION_M = 150.0
+# NOTE: the VQ1 course is ~159 m long (gate 5 at North −159, ~161 m from the
+# origin start), so 150 was cutting off the final stretch near gate 5.  Raised
+# well past the course length; genuine runaways (300–580 m) and in-course
+# stalls are still caught here or by the no-progress / stuck failsafes.
+MAX_EXCURSION_M = 250.0
+
+# SMOKE 057 (2026-06-02c): stationary-stuck failsafe.  Besides flying off
+# (excursion), the drone also gets *stuck* — telemetry freezes (crash/DNF) or
+# it hovers in one spot — and we'd otherwise wait out the whole run.  If it
+# stays within STUCK_RADIUS of an anchor for STUCK_TIMEOUT_S while racing,
+# reset and try again.  (A normally-progressing drone covers >STUCK_RADIUS
+# between gates, so this only fires on genuine stalls/freezes, not on a
+# wide orbit — that's a controller-tuning issue, handled separately.)
+STUCK_RADIUS_M = 2.5
+STUCK_TIMEOUT_S = 20.0  # only a true freeze/hover stays this still this long
+
+# SMOKE 060 (2026-06-02c): no-progress failsafe.  The drone can also LOOP a
+# gate — moving (so not "stuck") but circling without ever passing.  If no new
+# gate is passed within NO_PROGRESS_TIMEOUT_S of the last pass (or race start),
+# reset and retry instead of orbiting forever.  Set well above a legit slow
+# thread (gates can take ~45 s) so it only fires on genuine loops, never on a
+# good-but-slow run.
+NO_PROGRESS_TIMEOUT_S = 60.0
 
 # SMOKE 043 (2026-06-02c): a race counts as "live" for the whole 8 min after
 # its countdown, so if the sim is left running we connect and find a race that
@@ -354,6 +405,17 @@ async def run_race(
     # One-shot guard for dumping the gate-map course layout.
     gate_map_dumped: bool = False
 
+    # Frozen (lead-corrected) heading captured on entering the gate commit
+    # radius; None when not committed.  See HOVER_COMMIT_RADIUS.
+    commit_yaw_ned: float | None = None
+
+    # Stationary-stuck failsafe anchor (position + monotonic time).
+    stuck_anchor_pos: np.ndarray | None = None
+    stuck_anchor_t: float = 0.0
+
+    # No-progress failsafe: monotonic time of the last gate pass / race start.
+    last_progress_t: float = 0.0
+
     # --- Main control loop ---
     command_period = 1.0 / config.mavlink.command_rate_hz
     start_time = time.monotonic()
@@ -544,6 +606,7 @@ async def run_race(
                         elapsed,
                     )
                 last_active_gate_index = rs.active_gate_index
+                last_progress_t = time.monotonic()  # made progress; reset timer
 
             # Re-arm the start-transition on race end so the next Restart
             # captures a fresh hover target and resets PID integrator state.
@@ -587,6 +650,41 @@ async def run_race(
                         except Exception:
                             logger.exception("auto-restart: failed to send Backspace")
 
+            # Stationary-stuck + no-progress failsafes: reset if the drone
+            # hasn't moved beyond STUCK_RADIUS_M for STUCK_TIMEOUT_S (frozen /
+            # hovering) OR hasn't passed a gate within NO_PROGRESS_TIMEOUT_S
+            # (looping a gate), so we don't wait out the whole run.
+            if race_live and race_was_started and not excursion_aborted:
+                now_s = time.monotonic()
+                if stuck_anchor_pos is None or (
+                    float(np.linalg.norm(current_state.position - stuck_anchor_pos))
+                    > STUCK_RADIUS_M
+                ):
+                    stuck_anchor_pos = current_state.position.copy()
+                    stuck_anchor_t = now_s
+                stuck = now_s - stuck_anchor_t > STUCK_TIMEOUT_S
+                no_progress = now_s - last_progress_t > NO_PROGRESS_TIMEOUT_S
+                if stuck or no_progress:
+                    logger.warning(
+                        "%s — resetting run.",
+                        "Stuck stationary"
+                        if stuck
+                        else f"No gate passed in {NO_PROGRESS_TIMEOUT_S:.0f}s (looping)",
+                    )
+                    excursion_aborted = True
+                    race_was_started = False
+                    hover_setpoint_pos = None
+                    hover_setpoint_yaw_ned = None
+                    stuck_anchor_pos = None
+                    if auto_restart:
+                        try:
+                            import keyboard
+
+                            keyboard.send("backspace")
+                            logger.info("auto-restart: failsafe reset, sent Backspace to sim")
+                        except Exception:
+                            logger.exception("auto-restart: failed to send Backspace")
+
             # Stale-race guard: a race reads "live" for its whole 8 min, so if
             # we connected to one that started long ago the drone has been
             # uncontrolled (drifted / fell off the platform).  Refuse to hand
@@ -612,6 +710,7 @@ async def run_race(
 
             if not race_live:
                 excursion_aborted = False
+                stuck_anchor_pos = None
             if not race_live or excursion_aborted or joined_stale:
                 cmd = DroneCommand(
                     timestamp_ns=cmd.timestamp_ns,
@@ -628,6 +727,7 @@ async def run_race(
                 hover_setpoint_pos = current_state.position.copy()
                 hover_setpoint_yaw_ned = float(adapter.telemetry.attitude_yaw)
                 race_was_started = True
+                last_progress_t = time.monotonic()  # start the no-progress clock
                 logger.info(
                     "Race started — handing control to %s (active_gate=%d) "
                     "hover_target=%s yaw=%.1f°",
@@ -685,6 +785,8 @@ async def run_race(
                     target_up = drone_up
                     # Closing speed toward the gate (m/s); 0 ⇒ full forward cmd.
                     v_close = 0.0
+                    # Roll target for lateral (cross-track) correction; 0 ⇒ level.
+                    roll_target_eff = 0.0
                     rs = adapter.race_status
                     gates = adapter.gate_map
                     if rs is not None and gates and 0 <= rs.active_gate_index < len(gates):
@@ -698,6 +800,18 @@ async def run_race(
                         gate_dist_m = math.hypot(dn, de)
                         # Gate altitude in ENU-up = −(NED down).
                         target_up = -gate_d
+                        # Roll-based lateral correction toward the gate's East
+                        # line: PD on East offset (de) + East velocity.  Course
+                        # runs ~straight in North so body-Y ≈ East.  Sign is a
+                        # flag (HOVER_ROLL_SIGN) pending empirical confirmation.
+                        v_east = float(fd_world_vel[0]) if fd_world_vel is not None else 0.0
+                        roll_target_eff = HOVER_ROLL_SIGN * float(
+                            np.clip(
+                                HOVER_KP_ROLL * de - HOVER_KD_ROLL * v_east,
+                                -HOVER_ROLL_CLAMP_RAD,
+                                HOVER_ROLL_CLAMP_RAD,
+                            )
+                        )
                         if gate_dist_m > 1e-3:
                             # Closing speed = horizontal velocity projected onto
                             # the unit vector toward the gate.  ENU velocity:
@@ -729,9 +843,28 @@ async def run_race(
                                 )
                             target_yaw_ned = base_yaw - lead
 
+                    # Close-range heading freeze (smoke 054): lock the lead-
+                    # corrected heading on entry so we fly straight through the
+                    # plane instead of chasing the whipping close-range bearing.
+                    if not math.isnan(gate_dist_m) and (
+                        gate_dist_m < HOVER_COMMIT_RADIUS
+                        or (commit_yaw_ned is not None and gate_dist_m < HOVER_COMMIT_RELEASE)
+                    ):
+                        if commit_yaw_ned is None:
+                            commit_yaw_ned = target_yaw_ned
+                        target_yaw_ned = commit_yaw_ned
+                    else:
+                        commit_yaw_ned = None
+
+                    # PD altitude hold: P pulls toward the gate altitude, D
+                    # (on the reliable finite-diff vertical velocity) damps the
+                    # descent so it doesn't overshoot.  v_up>0 = climbing.
+                    v_up = float(fd_world_vel[2]) if fd_world_vel is not None else 0.0
                     hover_throttle = float(
                         np.clip(
-                            HOVER_THROTTLE + HOVER_KP_THROTTLE * (target_up - drone_up),
+                            HOVER_THROTTLE
+                            + HOVER_KP_THROTTLE * (target_up - drone_up)
+                            - HOVER_KD_THROTTLE * v_up,
                             HOVER_THROTTLE_MIN,
                             HOVER_THROTTLE_MAX,
                         )
@@ -790,7 +923,7 @@ async def run_race(
                     cmd = DroneCommand(
                         timestamp_ns=current_state.timestamp_ns,
                         throttle=hover_throttle,
-                        roll_rate=-HOVER_KP_ATTITUDE * roll_now,
+                        roll_rate=-HOVER_KP_ATTITUDE * (roll_now - roll_target_eff),
                         pitch_rate=+HOVER_KP_ATTITUDE * (pitch_now - pitch_target_eff),
                         yaw_rate=-HOVER_KP_ATTITUDE * yaw_err,
                     )
