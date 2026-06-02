@@ -195,6 +195,11 @@ NO_PROGRESS_TIMEOUT_S = 60.0
 # ~8 s, so use a much shorter timeout while still on the FIRST gate to recover
 # from bad starts fast (saves ~40 s/attempt) without risking mid-course gates.
 FIRST_GATE_TIMEOUT_S = 22.0
+# Bad-takeoff detector: the sim's rough auto-takeoff launches the drone well
+# above the start height (to +25 m) within seconds, while a good start stays
+# near gate-0 altitude (~0).  If it climbs past this above the start while still
+# on gate 0, reset immediately instead of waiting out the first-gate timeout.
+BAD_TAKEOFF_CLIMB_M = 8.0
 
 # SMOKE 043 (2026-06-02c): a race counts as "live" for the whole 8 min after
 # its countdown, so if the sim is left running we connect and find a race that
@@ -705,11 +710,20 @@ async def run_race(
                 on_first_gate = rs is not None and rs.active_gate_index <= 0
                 progress_timeout = FIRST_GATE_TIMEOUT_S if on_first_gate else NO_PROGRESS_TIMEOUT_S
                 no_progress = now_s - last_progress_t > progress_timeout
-                if stuck or no_progress:
+                # Bad takeoff: climbed far above the start while still on gate 0.
+                bad_takeoff = (
+                    on_first_gate
+                    and hover_setpoint_pos is not None
+                    and float(current_state.position[2]) - float(hover_setpoint_pos[2])
+                    > BAD_TAKEOFF_CLIMB_M
+                )
+                if stuck or no_progress or bad_takeoff:
                     logger.warning(
                         "%s — resetting run.",
                         "Stuck stationary"
                         if stuck
+                        else "Bad takeoff (climbed away)"
+                        if bad_takeoff
                         else f"No gate passed in {progress_timeout:.0f}s (looping)",
                     )
                     excursion_aborted = True
