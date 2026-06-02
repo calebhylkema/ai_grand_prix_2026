@@ -145,6 +145,17 @@ HOVER_ROLL_SIGN: float = -1.0
 HOVER_COMMIT_RADIUS: float = 10.0
 HOVER_COMMIT_RELEASE: float = 12.0
 
+# SMOKE 071 (2026-06-02c): EMA low-pass on the commanded rates to smooth the
+# flight.  The stacked corrections (lead yaw + roll cross-track + commit/taper
+# gating) are computed from instantaneous error with no smoothing, so the rate
+# commands jump tick-to-tick and the flight is jolty.  Blend each new command
+# with the previous one: cmd = a·new + (1−a)·prev.  Lower a = smoother but more
+# lag; 0.35 is a balance that stays responsive enough to thread the gates.
+HOVER_CMD_SMOOTH_ALPHA: float = 0.35
+# EMA factor for the finite-diff velocity (noisy dP/dt) before it feeds the
+# lead / roll / altitude-D terms.  Lower = smoother velocity, more lag.
+HOVER_VEL_SMOOTH_ALPHA: float = 0.3
+
 # Gravitational acceleration used for tilt-from-acceleration conversion.
 _G: float = 9.81
 
@@ -404,9 +415,11 @@ async def run_race(
     # not-live so the next attempt re-arms cleanly.
     excursion_aborted: bool = False
 
-    # Previous position/timestamp for finite-difference world velocity.
+    # Previous position/timestamp for finite-difference world velocity, plus
+    # the EMA-smoothed velocity estimate (reduces command jitter).
     prev_pos: np.ndarray | None = None
     prev_ts_ns: int | None = None
+    fd_vel_smooth: np.ndarray | None = None
 
     # Throttle for re-Backspacing when we've joined a stale (already-running)
     # race.  0.0 ⇒ the first stale detection may Backspace immediately.
@@ -425,6 +438,9 @@ async def run_race(
 
     # No-progress failsafe: monotonic time of the last gate pass / race start.
     last_progress_t: float = 0.0
+
+    # Previous hover command for EMA rate smoothing (reset each race).
+    hover_cmd_prev: DroneCommand | None = None
 
     # --- Main control loop ---
     command_period = 1.0 / config.mavlink.command_rate_hz
@@ -471,7 +487,19 @@ async def run_race(
             if prev_pos is not None and prev_ts_ns is not None:
                 dt_fd = (current_state.timestamp_ns - prev_ts_ns) / 1e9
                 if dt_fd > 1e-3:
-                    fd_world_vel = (current_state.position - prev_pos) / dt_fd
+                    raw_v = (current_state.position - prev_pos) / dt_fd
+                    # EMA-smooth the differentiated velocity (smoke 071): raw
+                    # dP/dt is noisy at ~100 Hz and feeds the yaw-lead, roll
+                    # cross-track and altitude-D terms, so its jitter is a main
+                    # source of jolty control.  Low-pass it at the source.
+                    if fd_vel_smooth is None:
+                        fd_vel_smooth = raw_v
+                    else:
+                        fd_vel_smooth = (
+                            HOVER_VEL_SMOOTH_ALPHA * raw_v
+                            + (1.0 - HOVER_VEL_SMOOTH_ALPHA) * fd_vel_smooth
+                        )
+                    fd_world_vel = fd_vel_smooth
             prev_pos = current_state.position.copy()
             prev_ts_ns = current_state.timestamp_ns
 
@@ -724,6 +752,7 @@ async def run_race(
             if not race_live:
                 excursion_aborted = False
                 stuck_anchor_pos = None
+                hover_cmd_prev = None  # don't carry smoothing across races
             if not race_live or excursion_aborted or joined_stale:
                 cmd = DroneCommand(
                     timestamp_ns=cmd.timestamp_ns,
@@ -946,6 +975,18 @@ async def run_race(
                         pitch_rate=+HOVER_KP_ATTITUDE * (pitch_now - pitch_target_eff),
                         yaw_rate=-HOVER_KP_ATTITUDE * yaw_err,
                     )
+                    # EMA low-pass to smooth jolt: blend with the previous cmd.
+                    if hover_cmd_prev is not None:
+                        a = HOVER_CMD_SMOOTH_ALPHA
+                        b = 1.0 - a
+                        cmd = DroneCommand(
+                            timestamp_ns=cmd.timestamp_ns,
+                            throttle=a * cmd.throttle + b * hover_cmd_prev.throttle,
+                            roll_rate=a * cmd.roll_rate + b * hover_cmd_prev.roll_rate,
+                            pitch_rate=a * cmd.pitch_rate + b * hover_cmd_prev.pitch_rate,
+                            yaw_rate=a * cmd.yaw_rate + b * hover_cmd_prev.yaw_rate,
+                        )
+                    hover_cmd_prev = cmd
                     # Verbose hover-controller log every 1 s so we can verify
                     # the yaw-toward-gate logic is actually computing what we
                     # expect (smoke 015 saw yaw stuck at 52° while target was
