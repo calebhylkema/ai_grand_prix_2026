@@ -88,7 +88,11 @@ HOVER_KP_ATTITUDE: float = 1.0
 # by IMU physics: at att.pitch=+17.8° the IMU reads accel=(-3.0, 0, -9.34)
 # which decomposes as -g·sin(17.8°) in body_x, characteristic of nose-down).
 # For forward thrust toward the active gate we want a small POSITIVE target.
-HOVER_PITCH_TARGET_RAD: float = +math.radians(7.0)  # SMOKE 065: faster cruise (was 5°)
+# Cruise pitch.  Speed sweep (smoke 065–069): 5°→41.5 s, 7°→33 s, 9°→30 s,
+# 11°→28 s full course.  Settled on 9° — strong speed with comfortable
+# threading margin for the 2.72 m gates; 11° rode the edge (push later under
+# supervision for VQ2 fastest-time).
+HOVER_PITCH_TARGET_RAD: float = +math.radians(9.0)
 """Tilt-angle clamp for the quaternion hover controller.  Beyond ~15° the
 small-angle ``tilt ≈ atan2(a, g)`` linearisation breaks down and the drone
 can run away laterally before the position term can pull it back."""
@@ -101,8 +105,11 @@ can run away laterally before the position term can pull it back."""
 # trustworthy.  Far ⇒ full forward; within HOVER_SLOW_RADIUS the drone creeps
 # in slowly so its lateral miss shrinks below the gate radius and it threads,
 # instead of sailing ~3 m past the hoop and oscillating through the region.
-HOVER_SLOW_RADIUS: float = 14.0  # m; begin slowing the approach inside this
-HOVER_PITCH_MIN_FRAC: float = 0.3  # floor on the taper so it keeps creeping in
+# SMOKE 067 (2026-06-02c): the course is near-straight, so braking to 30% at
+# every gate was over-slowing (racing principle: carry momentum, only slow for
+# tight turns).  Slow later (10 m) and less (0.55 floor) to carry speed through.
+HOVER_SLOW_RADIUS: float = 10.0  # m; begin slowing the approach inside this
+HOVER_PITCH_MIN_FRAC: float = 0.55  # floor on the taper so it keeps speed up
 
 # SMOKE 038 (2026-06-02c): lead-pursuit / proportional-navigation correction.
 # Smoke 037 proved pure pursuit (point nose at gate, drive forward) has a
