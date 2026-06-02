@@ -88,7 +88,7 @@ HOVER_KP_ATTITUDE: float = 1.0
 # by IMU physics: at att.pitch=+17.8° the IMU reads accel=(-3.0, 0, -9.34)
 # which decomposes as -g·sin(17.8°) in body_x, characteristic of nose-down).
 # For forward thrust toward the active gate we want a small POSITIVE target.
-HOVER_PITCH_TARGET_RAD: float = +math.radians(5.0)  # SMOKE 022: nose-down, confirm yaw-sign model
+HOVER_PITCH_TARGET_RAD: float = +math.radians(7.0)  # SMOKE 065: faster cruise (was 5°)
 """Tilt-angle clamp for the quaternion hover controller.  Beyond ~15° the
 small-angle ``tilt ≈ atan2(a, g)`` linearisation breaks down and the drone
 can run away laterally before the position term can pull it back."""
@@ -787,8 +787,14 @@ async def run_race(
                     target_yaw_ned = hover_setpoint_yaw_ned
                     gate_dist_m = float("nan")
                     drone_up = float(current_state.position[2])
-                    # Default: hold current altitude (zero correction).
-                    target_up = drone_up
+                    # Default: hold the RACE-START altitude, not the current one
+                    # (smoke 065).  Gate 0 is at the start height, and anchoring
+                    # here means a rough-start climb (e.g. the sim's auto-takeoff
+                    # kick) gets braked immediately instead of the target just
+                    # following the drone up while the gate map loads.
+                    target_up = (
+                        float(hover_setpoint_pos[2]) if hover_setpoint_pos is not None else drone_up
+                    )
                     # Closing speed toward the gate (m/s); 0 ⇒ full forward cmd.
                     v_close = 0.0
                     # Roll target for lateral (cross-track) correction; 0 ⇒ level.
