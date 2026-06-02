@@ -171,9 +171,12 @@ STUCK_TIMEOUT_S = 20.0  # only a true freeze/hover stays this still this long
 # gate — moving (so not "stuck") but circling without ever passing.  If no new
 # gate is passed within NO_PROGRESS_TIMEOUT_S of the last pass (or race start),
 # reset and retry instead of orbiting forever.  Set well above a legit slow
-# thread (gates can take ~45 s) so it only fires on genuine loops, never on a
-# good-but-slow run.
+# thread so it only fires on genuine loops, never on a good-but-slow run.
 NO_PROGRESS_TIMEOUT_S = 60.0
+# Rough starts (bad takeoff) loop on gate 0.  A good start passes gate 0 in
+# ~8 s, so use a much shorter timeout while still on the FIRST gate to recover
+# from bad starts fast (saves ~40 s/attempt) without risking mid-course gates.
+FIRST_GATE_TIMEOUT_S = 22.0
 
 # SMOKE 043 (2026-06-02c): a race counts as "live" for the whole 8 min after
 # its countdown, so if the sim is left running we connect and find a race that
@@ -663,13 +666,16 @@ async def run_race(
                     stuck_anchor_pos = current_state.position.copy()
                     stuck_anchor_t = now_s
                 stuck = now_s - stuck_anchor_t > STUCK_TIMEOUT_S
-                no_progress = now_s - last_progress_t > NO_PROGRESS_TIMEOUT_S
+                # Shorter timeout while still on gate 0 (rough-start recovery).
+                on_first_gate = rs is not None and rs.active_gate_index <= 0
+                progress_timeout = FIRST_GATE_TIMEOUT_S if on_first_gate else NO_PROGRESS_TIMEOUT_S
+                no_progress = now_s - last_progress_t > progress_timeout
                 if stuck or no_progress:
                     logger.warning(
                         "%s — resetting run.",
                         "Stuck stationary"
                         if stuck
-                        else f"No gate passed in {NO_PROGRESS_TIMEOUT_S:.0f}s (looping)",
+                        else f"No gate passed in {progress_timeout:.0f}s (looping)",
                     )
                     excursion_aborted = True
                     race_was_started = False
