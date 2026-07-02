@@ -16,17 +16,22 @@ uv sync --all-extras
 # Run tests
 uv run pytest
 
-# Launch simulation (once simulator is available)
-uv run python scripts/run_sim.py --config config/default.toml
+# VQ2 (active): verify control primitives against the sim (Training mode, run live)
+uv run python scripts/vq2/control_check.py --test rates --calib
+
+# Mock-sim pipeline (offline development)
+uv run python scripts/pre_sim/run_sim.py --config config/default.toml
 ```
 
 ## Architecture
 
 ```
-Camera Frame → Gate Detection → PnP Pose → ESKF Fusion → MPCC Planner → Controller → Motor Commands
+Camera Frame → Gate Detection → PnP Pose → ESKF Fusion → Guidance/MPCC → Rate Commands (MAVLink)
 ```
 
-See `docs/PLAN.md` for the full development roadmap and `docs/RESEARCH.md` for technical research.
+See `docs/ROADMAP.txt` for the development roadmap and status, `docs/RESEARCH.txt` for
+technical research, `docs/CODE_MAP.md` for what lives where, and `NEXT_SESSION.md` for
+the current working-session handoff.
 
 ## Claude Code
 

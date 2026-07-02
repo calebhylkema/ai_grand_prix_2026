@@ -1,0 +1,110 @@
+"""Unit tests locking in the VQ2 estimation math (attitude filter + ESKF).
+
+Run: uv run pytest scripts/vq2/test_estimation.py -q
+
+These encode the ground-truth-free / synthetic validations we relied on:
+- attitude estimator reads the known rest pose with zero gravity error,
+- the ESKF recovers a synthetic trajectory (position/velocity/attitude) from
+  synthesized IMU + gate measurements — guarding the Jacobians/sign conventions.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from eskf import ESKF, quat_from_rotvec
+from estimator import AttitudeEstimator, G, quat_mul, quat_to_matrix
+
+
+def test_quat_from_rotvec_small_angle() -> None:
+    q = quat_from_rotvec(np.array([0.0, 0.0, 0.0]))
+    assert np.allclose(q, [1.0, 0.0, 0.0, 0.0])
+    # 90 deg about z
+    q = quat_from_rotvec(np.array([0.0, 0.0, math.pi / 2]))
+    assert abs(q[0] - math.cos(math.pi / 4)) < 1e-6
+    assert abs(q[3] - math.sin(math.pi / 4)) < 1e-6
+
+
+def test_attitude_estimator_rest_pose() -> None:
+    """At the VQ2 start pose (accel (-3,0,-9.34)) the filter reads roll~0, pitch~-17.8."""
+    est = AttitudeEstimator()
+    accel = np.array([-3.0, 0.0, -9.34])
+    gyro = np.zeros(3)
+    for _ in range(300):
+        est.update(gyro, accel, 0.01)
+    roll, pitch, _ = est.euler
+    assert abs(math.degrees(roll)) < 1.0
+    assert abs(math.degrees(pitch) - (-17.8)) < 1.0
+    assert est.mean_grav_err_deg < 0.5
+
+
+def _run_synthetic(seed: int = 0) -> tuple[float, float, float]:
+    rng = np.random.default_rng(seed)
+    dt = 0.01
+    steps = 500
+    ba_true = np.array([0.10, -0.05, 0.08])
+    bg_true = np.array([0.010, -0.008, 0.005])
+    sig_a, sig_g, sig_pnp = 0.05, 0.002, 0.05
+    p = np.array([-8.0, 1.0, -0.5])
+    v = np.zeros(3)
+    q = np.array([1.0, 0.0, 0.0, 0.0])
+    kf = ESKF(pnp_pos_sig=0.08)
+    perr, verr, terr = [], [], []
+    for k in range(steps):
+        t = k * dt
+        if t < 0.5:
+            a_world, omega = np.zeros(3), np.zeros(3)
+        else:
+            tt = t - 0.5
+            a_world = np.array(
+                [1.2 * math.sin(0.8 * tt), 0.5 * math.sin(1.3 * tt), 0.4 * math.sin(1.1 * tt)]
+            )
+            omega = np.array(
+                [0.4 * math.sin(1.5 * tt), 0.3 * math.sin(0.9 * tt), 0.25 * math.sin(0.6 * tt)]
+            )
+        v = v + a_world * dt
+        p = p + v * dt + 0.5 * a_world * dt * dt
+        q = quat_mul(q, quat_from_rotvec(omega * dt))
+        q /= np.linalg.norm(q)
+        rmat = quat_to_matrix(q)
+        a_m = rmat.T @ (a_world - np.array([0, 0, G])) + ba_true + rng.normal(0, sig_a, 3)
+        w_m = omega + bg_true + rng.normal(0, sig_g, 3)
+        kf.predict(a_m, w_m, dt)
+        kf.update_gravity(a_m)
+        if k % 3 == 0 and t > 0.05:
+            z = -rmat.T @ p + rng.normal(0, sig_pnp, 3)
+            if k == 6:  # first gate obs: anchor (large initial innovation), then fuse
+                kf.reanchor(z)
+            else:
+                kf.update_gate(z)
+        if t > 1.0:
+            perr.append(np.linalg.norm(kf.p - p))
+            verr.append(np.linalg.norm(kf.v - v))
+            dq = quat_mul(np.array([q[0], -q[1], -q[2], -q[3]]), kf.q)
+            terr.append(math.degrees(2 * math.asin(min(1.0, np.linalg.norm(dq[1:])))))
+    return (
+        float(np.sqrt(np.mean(np.square(perr)))),
+        float(np.sqrt(np.mean(np.square(verr)))),
+        float(np.sqrt(np.mean(np.square(terr)))),
+    )
+
+
+def test_eskf_recovers_synthetic_trajectory() -> None:
+    perr, verr, terr = _run_synthetic()
+    assert perr < 0.4, f"position error too high: {perr}"
+    assert verr < 0.4, f"velocity error too high: {verr}"
+    # yaw is only weakly observable (gate updates get chi2-gated during the maneuver);
+    # roll/pitch stay good via gravity. 5deg is fine — we steer by gate bearing anyway.
+    assert terr < 5.0, f"attitude error too high: {terr}"
+
+
+def test_eskf_rest_no_drift() -> None:
+    """On the ground (rest) the ESKF velocity must not drift."""
+    kf = ESKF()
+    accel = np.array([-3.0, 0.0, -9.34])
+    gyro = np.zeros(3)
+    for _ in range(500):
+        kf.predict(accel, gyro, 0.01)
+        kf.update_gravity(accel)
+    assert float(np.linalg.norm(kf.v)) < 0.05, f"rest velocity drifted: {kf.v}"

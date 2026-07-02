@@ -54,6 +54,7 @@ CLAUDE.local.md
 .env
 *.key
 
-# Simulator install + capture artifacts (large / local)
-SIMULATOR/
-start_frame.png
+# Simulator installs (large / local). SIMULATOR/ = VQ1 sim v1.0.3364 (ground-truth
+# validation rig — keep). VQ2/ = VQ2 sim v1.0.3379.
+/SIMULATOR/
+/VQ2/

@@ -21,19 +21,28 @@ Python-only autonomy stack for the Anduril AI Grand Prix 2026 ($500K autonomous 
 ## Repository Layout
 
 ```
-drone_racing/          # Main package
+drone_racing/          # Main package (organized by function)
   perception/          # Gate detection (YOLO keypoint + classical CV fallback)
   estimation/          # ESKF: IMU propagation + vision corrections
   planning/            # MPCC racing line + receding horizon
   control/             # RL policy, PID fallback, safety ladder
-  sim/                 # Simulator adapter (MAVLink/MAVSDK interface)
+  sim/                 # Simulator adapter (pymavlink / MAVSDK / mock)
   logging/             # Flight telemetry recording
   utils/               # Coordinate transforms, math helpers
-config/                # TOML scenario configs
-scripts/               # Entry points: run_sim.py, train_policy.py
+scripts/               # Entry points, organized BY PHASE
+  vq2/                 # ⭐ ACTIVE — VQ2 stack (race.py, control_check.py, eskf.py, ...)
+  vq1/                 # retired VQ1 runner + probes (ground-truth-rig tooling)
+  pre_sim/             # mock-sim era tooling (training, benches)
+config/                # TOML configs (note: scripts/vq2 hardcodes VQ2 spec intrinsics)
 tests/                 # pytest suite with fixtures
-docs/                  # Research findings, competition notes
+docs/                  # specs/ (official PDFs+refs), adr/, ROADMAP.txt, RESEARCH.txt, CODE_MAP.md
+data/ models/ logs/ runs/   # gitignored artifacts (training data, weights, flight logs)
+SIMULATOR/             # VQ1 sim v1.0.3364 install — ground-truth validation rig, KEEP
+VQ2/                   # VQ2 sim v1.0.3379 install
+NEXT_SESSION.md        # ⭐ read-first handoff for the next working session
 ```
+
+See `docs/CODE_MAP.md` for the per-file map.
 
 ## Development Rules
 
@@ -51,7 +60,9 @@ docs/                  # Research findings, competition notes
 
 - MUST NOT use `time.sleep()` in the control loop — use async or event-driven patterns
 - MUST NOT hardcode gate dimensions — read from config
-- MUST NOT modify files in `control/safety.py` without explicit human approval
+- MUST NOT weaken safety/failsafe logic (watchdogs, rate/thrust clamps, envelope
+  protection — inline in the controllers; a dedicated `control/safety.py` was planned
+  but never created) without explicit human approval
 - MUST NOT use OpenCV `imshow` in production code — gate behind `--debug` flag
 - MUST NOT commit secrets, API keys, or competition credentials
 
@@ -87,7 +98,7 @@ uv run python scripts/train_policy.py   # Train RL policy
 ## Competition Phases
 
 1. **VQ1 (May 2026, open through VQ2):** < 10 gates, minimal distractions, clear gate visibility, full 3D with elevation changes. Focus on **completion**. Unlimited attempts, 8 min max per run.
-2. **VQ2 (June–mid/late July 2026):** < 20 gates, increased complexity (lighting changes, 3D objects, obstacles). Fastest valid time counts.
+2. **VQ2 (LIVE 2026-06-30, sim v1.0.3379, spec VADR-TS-003):** < 20 gates, increased complexity (dynamic lighting, 3D-scanned scenes, obstacles). Fastest valid time counts; objective = qualify for the physical round. **⚠️ Telemetry cut: `ATTITUDE`, `LOCAL_POSITION_NED`, `ODOMETRY`, and `GATE_INFO`/`TRACK_INFO` are REMOVED — only IMU + camera + RACE_STATUS remain. State estimation + vision are now mandatory (see `docs/specs/vq2_spec.md`).** Training vs Competitive modes; competitive runs are code-auditable.
 3. **Physical Qualifier (Sept 2026, SoCal):** Real Neros drone, sim-to-real gap is the challenge
 4. **Finals (Nov 2026, Columbus OH):** Head-to-head racing, reliability wins
 

@@ -30,7 +30,15 @@ The Anduril AI Grand Prix 2026 is a $500K autonomous drone racing competition. A
 - 6-axis IMU (gyroscope + accelerometer)
 - NO LiDAR, NO GPS, NO stereo vision, NO depth sensor, NO external positioning
 
-### Simulator Interface (CONFIRMED — VADR-TS-001)
+### ⚠️ VQ2 UPDATE (VADR-TS-003, 2026-06-30) — telemetry cut back
+> The VQ1 interface below is SUPERSEDED for VQ2. VQ2 REMOVES `ATTITUDE`, `LOCAL_POSITION_NED`,
+> `ODOMETRY`, and `GATE_INFO`/`TRACK_INFO`. VQ2 telemetry = **HIGHRES_IMU + camera (30 Hz,
+> 640×360) + RACE_STATUS + COLLISION** only. No orientation, position, velocity, or gate map is
+> given — we run our own state estimation and vision. This makes the ESKF/PnP/perception stack the
+> mainline (the same monocular+IMU problem originally scoped for the physical qualifier). Full VQ2
+> detail: `docs/specs/vq2_spec.md`. The sections below remain accurate for the VQ1 build.
+
+### Simulator Interface (CONFIRMED — VADR-TS-001, VQ1)
 - **Communication:** MAVLink v2 over UDP via MAVSDK-compatible interfaces
 - **Telemetry (Sim → Client):** HEARTBEAT, ATTITUDE, HIGHRES_IMU, ODOMETRY, TIMESYNC
 - **Control (Client → Sim):** SET_ATTITUDE_TARGET, SET_POSITION_TARGET_LOCAL_NED
@@ -317,7 +325,8 @@ TensorRT optimization reduces inference latency 2–3× on Jetson hardware.
 
 ## 12. ChatGPT Research Integration
 
-The original ChatGPT research document (preserved in `docs/CHATGPT_RESEARCH.md`) contributed:
+The original ChatGPT research document (fully absorbed into this file; the standalone
+copy was deleted in the 2026-07-01 docs consolidation) contributed:
 - Competition overview and constraint documentation
 - VQ1/VQ2 qualifier structure details
 - System architecture flow diagram

@@ -33,10 +33,10 @@ from drone_racing.utils.config import load_config
 from drone_racing.utils.types import DroneCommand, GateWaypoint, Telemetry
 
 # ---------------------------------------------------------------------------
-# Import the private helpers from scripts/run_race.py directly so this test
+# Import the private helpers from scripts/vq1/run_race.py directly so this test
 # exercises the real code path rather than a copy.
 # ---------------------------------------------------------------------------
-_RUN_RACE = Path(__file__).resolve().parents[1] / "scripts" / "run_race.py"
+_RUN_RACE = Path(__file__).resolve().parents[1] / "scripts" / "vq1" / "run_race.py"
 _spec = importlib.util.spec_from_file_location("_run_race_under_test", _RUN_RACE)
 assert _spec is not None and _spec.loader is not None
 _run_race = importlib.util.module_from_spec(_spec)

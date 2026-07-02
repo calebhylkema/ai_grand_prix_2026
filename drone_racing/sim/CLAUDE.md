@@ -47,7 +47,7 @@ All conversions happen at the adapter boundary via `transforms.ned_to_enu()` and
 
 Until the real simulator launches (May 2026), use `MockSimAdapter` for testing.
 When the sim drops:
-1. Run `scripts/run_race.py` to connect
+1. Run `scripts/vq1/run_race.py` to connect
 2. Validate telemetry stream contents (especially ODOMETRY fields)
 3. Tune command rate and control gains for the real physics model
 4. Capture vision stream once format is specified
