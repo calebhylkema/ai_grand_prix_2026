@@ -34,12 +34,16 @@ import math
 import sys
 import threading
 import time
+from pathlib import Path
 
 import control_check as cc
+import cv2
+import gates
 import numpy as np
-import race as rc
 from estimator import AttitudeEstimator
 from pymavlink import mavutil
+
+COLL_DUMP_DIR = Path(__file__).resolve().parents[2] / "data" / "vq2" / "fly_collisions"
 
 # Calibration is ALWAYS on for this controller: cc.send_att maps desired->raw rates.
 cc.CALIBRATE = True
@@ -53,7 +57,7 @@ KP_ATT_PITCH = 4.0
 MAX_RATE = 2.0  # clamp desired roll/pitch rates (rad/s) — gentle by design
 
 # --- forward flight (stage b) ---
-PITCH_FWD = -0.07  # rad, gentle nose-down target => slow forward drift
+PITCH_FWD = -0.05  # rad, gentle nose-down target => slow forward drift (SLOW first)
 KP_YAW_BEAR = 1.5  # desired yaw rate per rad of bearing to the gate (body frame)
 MAX_YAW = 1.0  # rad/s
 SEARCH_YAW = 0.4  # rad/s slow scan when no gate visible
@@ -68,38 +72,32 @@ MAX_ROLL_TGT = 0.12  # rad (~7 deg) bank clamp — gentle by design
 CY_TARGET = 130.0
 KP_THR_PX = 0.10
 THR_MIN, THR_MAX = 0.25, 0.36
+VERT_RANGE_M = 7.0  # only run the descent servo when the gate is close: descending
+#                     toward a far LOW gate drops the drone into intervening dark
+#                     structures (confirmed in data/vq2/fly_collisions frame dumps)
 
 # post-gate brake: the launch/cruise carries real momentum and we have no velocity
 # estimate yet, so after each gate pass pitch UP briefly to bleed speed before the turn
 # (live finding 2026-07-01: collisions near gate 1 happen with PERFECT attitude — the
 # failure is entry speed, not stability).
-BRAKE_SECS = 1.2
-BRAKE_PITCH = +0.14  # rad nose-up while braking
+BRAKE_SECS = 2.2  # 1.2s/+0.14 bled only ~1.6 m/s of an estimated 4-6 m/s of launch
+BRAKE_PITCH = +0.22  # momentum -> still hit the dark structure right of gate 0; ~5 m/s now
 
 # --- failsafes ---
 TILT_ABORT = math.radians(60.0)  # attitude estimator says we're tumbling
 COLL_ABORT = 3  # collision messages before aborting the attempt
-STAB_SECS = 1.5  # hover-stabilize window before moving forward
+STAB_SECS = 1.5  # initial window before point-and-go
+STAB_PITCH = 0.0  # LEVEL through the sim's launch. Tried +0.10 nose-up to bleed the
+#                   launch momentum before gate 0 (2026-07-02): the drone then hit the
+#                   gate-0 FRAME instead of threading (3/3). Ride the launch level
+#                   (gate 0 threads 100%), brake after.
 
 
-def _bearing_to_gate(frame: np.ndarray) -> tuple[float, float, float] | None:
-    """(bearing_rad, elevation_m?, range_m) of the nearest gate in BODY frame, or
-    fall back to the blob center when the quad/PnP is unavailable (bearing only)."""
-    pose = rc.closest_gate_pose(frame)
-    if pose is not None:
-        gate_body = rc.CAM_TO_BODY @ np.array(pose)
-        rng = float(np.linalg.norm(gate_body))
-        return (float(math.atan2(gate_body[1], gate_body[0])), float(gate_body[2]), rng)
-    blob = rc.detect_gate(frame)
-    if blob is not None:
-        # normalized image-x -> approximate bearing through fx=320 (VQ2 spec)
-        return (float(math.atan2(blob[0] - 320.0, 320.0)), float("nan"), float("nan"))
-    return None
-
-
-def _blob_cy(frame: np.ndarray) -> float | None:
-    blob = rc.detect_gate(frame)
-    return None if blob is None else float(blob[1])
+# Perception: gates.nearest() returns ONLY ring-validated gates. The former blob
+# fallback steered into glow-lit walls (root cause of the gate-1 ENV collisions —
+# confirmed frame-by-frame in runs/vq2_collisions); glow is never a target now.
+# A short persistence window bridges detection dropouts between valid sightings.
+TARGET_HOLD_S = 0.8
 
 
 class Flight:
@@ -216,6 +214,9 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
     t0 = time.time()
     gate_prev = -1
     brake_until = 0.0
+    held: gates.GateTarget | None = None  # last validated target (persistence)
+    held_at = 0.0
+    coll_seen = 0
     last_sight: tuple[float, float, float] | None = None  # (t_rel, bearing, range)
     reason = "timeout"
     while time.time() - t0 < secs:
@@ -227,7 +228,7 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
             reason = stop
             break
         stabilizing = (time.time() - t0) < STAB_SECS
-        pitch_target = 0.0
+        pitch_target = STAB_PITCH if stabilizing else 0.0
         roll_target = 0.0
         yr = 0.0
         thr = HOVER_THRUST
@@ -241,29 +242,50 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
                 if gate_prev >= 0:  # real gate pass (not the initial 0 latch): brake
                     brake_until = time.time() + BRAKE_SECS
                 gate_prev = gate_now
-            bearing = None
+            with fl.sh.lock:
+                coll_now = fl.sh.collisions - fl.coll0
+            if coll_now > coll_seen and frame is not None:  # dump the collision view
+                COLL_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+                roll_d, pitch_d, _ = (math.degrees(v) for v in fl.att.euler)
+                name = f"c{coll_now}_t{time.time() - t0:.1f}s_r{roll_d:+.0f}p{pitch_d:+.0f}.png"
+                cv2.imwrite(str(COLL_DUMP_DIR / name), frame)
+                coll_seen = coll_now
             if frame is not None:
-                tgt = _bearing_to_gate(frame)
+                tgt = gates.nearest(frame)
                 if tgt is not None:
-                    bearing = tgt[0]
-                    last_sight = (time.time() - t0, tgt[0], tgt[2])
-                cy = _blob_cy(frame)
-                if cy is not None:  # gate low in image => we are high => less thrust
-                    thr = float(
-                        np.clip(
-                            HOVER_THRUST - KP_THR_PX * ((cy - CY_TARGET) / 180.0), THR_MIN, THR_MAX
-                        )
+                    held, held_at = tgt, time.time()
+                    rng = tgt.range_m
+                    last_sight = (
+                        time.time() - t0,
+                        tgt.bearing,
+                        rng if rng is not None else float("nan"),
                     )
+            if held is not None and time.time() - held_at > TARGET_HOLD_S:
+                held = None  # sighting stale: stop chasing it
             braking = time.time() < brake_until
-            if bearing is None:
-                yr = SEARCH_YAW  # scan; stay put (pitch level) until we see a gate
+            if held is None:
+                yr = SEARCH_YAW  # scan; stay put (pitch level) until we see a REAL gate
             else:
+                bearing = held.bearing
                 yr = float(np.clip(KP_YAW_BEAR * bearing, -MAX_YAW, MAX_YAW))
                 # brake into the turn: forward pitch only when roughly aligned
                 align = max(0.0, 1.0 - abs(bearing) / BRAKE_BEAR)
                 pitch_target = PITCH_FWD * align
                 # gentle bank toward the gate: rotates the velocity vector in turns
                 roll_target = float(np.clip(KP_ROLL_BEAR * bearing, -MAX_ROLL_TGT, MAX_ROLL_TGT))
+                # vertical: image-row servo on the VALIDATED gate only (the old blob
+                # fallback followed floor/wall glow straight into the environment),
+                # and only at close range — far low gates must not trigger an early
+                # descent through whatever stands in between. Far/unknown range: hold.
+                rng = held.range_m
+                if rng is not None and rng < VERT_RANGE_M:
+                    thr = float(
+                        np.clip(
+                            HOVER_THRUST - KP_THR_PX * ((held.cy - CY_TARGET) / 180.0),
+                            THR_MIN,
+                            THR_MAX,
+                        )
+                    )
             if braking:  # bleed post-gate momentum before chasing the next gate
                 pitch_target = BRAKE_PITCH
                 roll_target = 0.0

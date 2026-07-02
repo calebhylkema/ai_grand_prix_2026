@@ -93,18 +93,55 @@ A full audit + reorganization pass was done. If a path from memory 404s, check h
   now OFF pending a `--test translate --calib` sign check); slower pitch (−0.07) and a
   1.2s post-gate pitch-up brake did NOT stop the ENV hits alone.
 
+## ✅ UPDATE 2 (2026-07-02): perception SOLVED, obstacle identified — the frontier moved
+
+Committed: branch `vq2-reorg-calibrated-controller` (reorg + fly.py in 8fd2f90, then
+this session's perception work). `runs/` pruned 8.8 GB → 0.5 GB (kept trained YOLO
+weights `runs/pose/.../best.onnx|pt`, RL `runs/rl_v1/`, all vq2 recordings).
+
+### What was found by LOOKING at the captured frames (Claude can read PNGs!)
+- `runs/vq2_collisions/*.png` (race.py's dumps, filename = PnP pose) show the truth:
+  the gates cast a huge diffuse red GLOW on nearby walls/pillars/floor. **Both the
+  blob centroid AND naive quad fits lock onto glow** → race.py/fly.py steered INTO
+  glow-lit walls. Confirmed frame-by-frame. Far tiny gates also gave garbage PnP
+  locks (the old x+13m "poses").
+- **FIX SHIPPED — `scripts/vq2/gates.py`:** ring-validated detection (a gate is a red
+  RING around a non-red core; glow is SOLID ~0.9 fill vs gate ~0.4; border-touching
+  contours = partial gates rejected; PnP only from quads ≥800 px²; minAreaRect
+  fallback for banner/perspective). Validated offline in `scripts/vq2/detect_lab.py`
+  over 1118 real frames. fly.py now steers ONLY on validated gates (0.8s persistence,
+  else search) — no more glow-chasing, and its sighting logs are now trustworthy.
+- **The remaining blocker is now PHYSICAL, not perceptual:** a huge dark 3D-scanned
+  sloped structure sits right of the gate-0 exit line (see `data/vq2/fly_collisions/`
+  — fly.py dumps a frame on every collision now). The sim LAUNCHES the drone off the
+  platform (~6+ m/s; gate 0 crossed 0.6s after stabilize); ~1.2s later it skims that
+  structure → ENV collisions at t≈3.3s. Consistent 100% of attempts.
+
+### Tried and measured (don't redo)
+- Post-gate pitch-up brake +0.14/1.2s and +0.22/2.2s: collision time unchanged (~3.3s).
+- Nose-up during the launch window (STAB_PITCH +0.10): drone hits the gate-0 FRAME
+  instead of threading (3/3) — ride the launch LEVEL (gate 0 = 100%), brake after.
+- Range-gated descent (VERT_RANGE_M=7, in fly.py): correct idea (stops early descent
+  toward the far low gate) but the dark structure is hit at cruise height too.
+- Bank-toward-gate 0.25: worse (off; sign unverified).
+
 ### → NEXT SESSION, concrete order
-1. Commit everything first (reorg + fly.py; branch off master).
-2. **Watch a fly.py run with eyes on the sim window** (`--stage race --attempts 3`) —
-   identify WHAT the ENV collision object is (pillar? floor? wall?). One look decides
-   the fix; the logs can't.
-3. **Fix perception on the gate-1 approach** (the blocker): why does `closest_gate_pose`
-   fail there (occlusion by pillars? gate partially out of frame? approxPolyDP too strict?).
-   Options: corner-subset PnP, keep last metric range + decay, or dump frames at the
-   failure moment (`data/vq2/`) and look.
-4. **Metric turn trajectory** on ESKF state + `guidance.py` (both validated; guidance
-   finally has correct rates to work with) — arrive centered in position AND velocity.
-5. Then the speed roadmap in `docs/ROADMAP.txt` (racing line/MPCC → 100 Hz → cruise).
+1. **Beat the dark structure after gate 0.** Ideas, best first:
+   a. Watch one run with eyes on the sim (the structure's exact geometry decides this);
+   b. steer a fixed OPEN-SPACE heading for ~1.5s after gate 0 (continue gate-0's exit
+      direction, do NOT turn right toward gate 1's bearing yet — the straight-line
+      path to gate 1 clips the structure), THEN acquire gate 1;
+   c. use the optical-flow looming net (race.py `compute_looming`) to veto headings;
+   d. climb over it (hold extra thrust after gate 0, descend only at range<7m — the
+      range-gated descent is already in fly.py).
+2. **Velocity estimate** (ESKF or flow) so braking is closed-loop, not timed.
+3. **Metric turn trajectory** on ESKF + `guidance.py` once past the structure.
+4. Then the speed roadmap in `docs/ROADMAP.txt` (racing line/MPCC → 100 Hz → cruise).
+
+### The offline lab loop (use it — it needs no sim)
+`uv run python scripts/vq2/detect_lab.py [--annotate N] [--glob 'g1_*.png']` scores
+detector variants over the captured frames; `mask_peek.py <frame>` visualizes masks;
+annotated output lands in `data/vq2/lab/`. Claude can Read the PNGs to judge quality.
 
 ## Norms
 Commit only when the user asks; branch first if on master. Run
