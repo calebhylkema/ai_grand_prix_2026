@@ -72,7 +72,10 @@ KP_ATT_PITCH = 4.0
 MAX_RATE = 2.0  # clamp desired roll/pitch rates (rad/s) — gentle by design
 
 # --- forward flight (stage b) ---
-PITCH_FWD = -0.05  # rad, gentle nose-down target => slow forward drift (SLOW first)
+PITCH_FWD = -0.05  # rad, gentle nose-down target => slow forward drift (SLOW first).
+#                    Tried -0.03 (slower) to fix the gate-1 miss: NO help (bearing still
+#                    ends -37°). The rightward miss is independent of forward speed — yaw/bank
+#                    can't redirect the launch-direction momentum. Needs velocity guidance.
 KP_YAW_BEAR = 1.5  # desired yaw rate per rad of bearing to the gate (body frame)
 MAX_YAW = 1.0  # rad/s
 SEARCH_YAW = 0.4  # rad/s slow scan when no gate visible
@@ -148,10 +151,10 @@ TILT_COMP_MIN_COS = 0.5  # tilt-compensate thrust by 1/(cosR·cosP) so BANKING a
 # estimate yet, so after each gate pass pitch UP briefly to bleed speed before the turn
 # (live finding 2026-07-01: collisions near gate 1 happen with PERFECT attitude — the
 # failure is entry speed, not stability).
-BRAKE_SECS = 0.0  # DISABLED 2026-07-02: the trace proved the gate-1 collision is a SINK
-#                   into the floor, not a lateral structure. The nose-up brake pitched the
-#                   camera into the floor and forced flat thrust during the sink. Off.
-BRAKE_PITCH = +0.22  # (retained; unused while BRAKE_SECS=0)
+BRAKE_SECS = 0.0  # OFF. Tried a 1.2 s post-gate-0 speed-kill brake (+0.15 nose-up) to slow
+#                   the gate-1 approach: NO help (bearing still ends -37°, gate lost earlier).
+#                   The gate-1 miss is not a forward-speed problem — needs velocity guidance.
+BRAKE_PITCH = +0.15  # (retained; unused while BRAKE_SECS=0)
 
 # post-gate OPEN-SPACE heading hold (2026-07-02): braking alone never changed the
 # ~3.3s collision — the drone rides the launch momentum straight into a dark 3D
