@@ -111,8 +111,13 @@ THR_MIN, THR_MAX = 0.25, 0.45  # was 0.36: give the climb servo real authority t
 # from the floor). A gate below center (cy>target) => DESCEND, allowed only when the gate
 # is clearly CLOSE (large area) so a far LOW gate can't pull us into the floor.
 DESCEND_AREA = 2500.0  # px^2 — only descend toward a gate at least this big in frame
-NO_GATE_CLIMB = 0.015  # thrust bias above hover when no gate is visible: forward flight
-#                        bleeds vertical lift, so hold a mild climb rather than sink blind
+NO_GATE_CLIMB = 0.03  # thrust bias above hover when no gate is visible: forward flight
+#                       bleeds vertical lift, so hold a mild climb rather than sink blind
+TILT_COMP_MIN_COS = 0.5  # tilt-compensate thrust by 1/(cosR·cosP) so BANKING a turn (which
+#                          tilts the thrust vector) doesn't bleed altitude — the sink
+#                          recurred on the hard left turn past gate 1 (fly_trace). Uses the
+#                          RELIABLE attitude estimate, not the biased IMU vz. Bounded so a
+#                          near-90° tumble can't command infinite thrust.
 
 # post-gate brake: the launch/cruise carries real momentum and we have no velocity
 # estimate yet, so after each gate pass pitch UP briefly to bleed speed before the turn
@@ -201,6 +206,12 @@ class Flight:
         pr = float(np.clip(pr, -MAX_RATE, MAX_RATE))
         yr = float(np.clip(yr, -MAX_YAW, MAX_YAW))
         cc.send_att(self.conn, *self.tgt, self.lock, thr, rr, pr, yr)
+
+    def tilt_comp(self, thr: float) -> float:
+        """Scale thrust by 1/(cosR·cosP) so a banked/pitched turn holds altitude."""
+        roll, pitch, _ = self.att.euler
+        c = math.cos(roll) * math.cos(pitch)
+        return float(np.clip(thr / max(TILT_COMP_MIN_COS, c), THR_MIN, THR_MAX))
 
     def level_rates(
         self, pitch_target: float = 0.0, roll_target: float = 0.0
@@ -400,7 +411,7 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
                 yr = 0.0
             # thrust ALWAYS tracks the gate's image row (or a mild climb bias when blind)
             # — even while braking/holding, which is exactly when the drone was sinking.
-            thr = vertical_thrust(held, cy_rate)
+            thr = fl.tilt_comp(vertical_thrust(held, cy_rate))
         if race_mode and time.time() - t0 >= trace_next:
             _trace_frame(fl, TRACE_DIR, time.time() - t0, trace_i, held, gate_prev)
             trace_i += 1

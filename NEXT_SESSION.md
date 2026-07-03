@@ -21,14 +21,15 @@ Sept physical round. VQ2 work is in `scripts/vq2/`. Keep the sim in **Training**
   lateral structure. Proven by a new trajectory recorder (below): the gate climbed out the
   top of the frame while the floor filled the view. The vertical servo that should have
   climbed never fired (it was range-gated on PnP range, which is ALWAYS nan on 3379).
-- **FIXED this session** → the drone now reaches **gate 1's vicinity at t≈4.5–5.5s** (was
-  3.3s), centring gate 1 in both axes and flying through its plane (bearing sweeps +35°→0→
-  −36° as we pass; gate area explodes then a new small gate is acquired). Big, consistent
-  progress. See "What changed" below.
-- **NEW frontier = a DIFFERENT obstacle at/just past gate 1** (`COLLISION 1002 ENV
-  threat2`, was threat1) at t≈5–5.6s, which knocks the drone tumbling (tilt→80–97° is the
-  RESULT of the impact, not the cause). Also `active_gate` never leaves 1 → gate-1 pass may
-  not be registering cleanly (we may be clipping its frame on the way through).
+- **FIXED this session** → the drone now reaches **gate 1's vicinity at t≈4.5–6.1s** (was
+  3.3s), stable throughout. Big, consistent progress. See "What changed" below.
+- **BUT we still MISS gate 1** — `active_gate` = the NEXT-target gate index (RACE_STATUS
+  `gate`: 0 while parked, →1 on takeoff, increments as gates are passed). It **never leaves
+  1**, so gate 1 is never actually threaded. The trace shows why: on final approach the gate
+  sweeps from bearing +5°→−35° while its area explodes — i.e. **it slides to our LEFT and we
+  pass on its RIGHT edge.** We overshoot laterally; centring doesn't hold through the last
+  ~1 m. Then we hit `ENV threat2` (a floor/structure) during the ensuing hard LEFT turn
+  toward the next gate, and the impact knocks us tumbling (tilt→60–97° is the RESULT).
 
 ## ⭐ What changed in fly.py this session (2026-07-02 pm) — all committed-worthy
 1. **Self-diagnosis tooling (the user's ask: "solve it from the drone's own inputs"):**
@@ -52,6 +53,9 @@ Sept physical round. VQ2 work is in `scripts/vq2/`. Keep the sim in **Training**
    launch momentum. Verified correct sign in fly_trace (rolled right toward a right gate).
 5. **BRAKE_SECS and HOLD_HEADING_SECS set to 0** (disabled): they were built on the wrong
    "lateral structure" theory and forced flat thrust during the sink. Constants retained.
+6. **Tilt-compensated thrust** (`Flight.tilt_comp`, `TILT_COMP_MIN_COS`): scale thrust by
+   1/(cosR·cosP) using the reliable attitude estimate, so banking a turn doesn't bleed
+   altitude — the sink recurred on the hard left turn past gate 1. Marginal help so far.
 
 ## ⭐⭐ The multi-day root cause (2026-07-01) — rate calibration
 The drone tumbled at every turn for days. Measured the control primitives directly (gyro =
@@ -127,16 +131,18 @@ Far tiny gates also gave garbage PnP (the old x+13m fly-off "poses").
    then `ls data/vq2/fly_trace | sort` and Read the last ~8 PNGs (filenames carry
    t/roll/pitch/vz/gate). This shows the approach into the terminal collision WITHOUT eyes
    on the sim — it is how the floor sink got solved. Do this before changing anything.
-1. **Beat the threat2 obstacle at/just past gate 1.** From this session's traces we reach
-   gate 1 centred (cy≈130, bearing≈0) at t≈4s then hit ENV threat2 at ~5s. Likely we clip
-   gate 1's own FRAME on the way through (close-range bearing/cy swing hard) or hit a
-   structure immediately beyond it. Ideas: (a) once the gate is BIG+centred (area>~4000)
-   stop steering and commit straight through (freeze roll/yaw so we don't over-bank into the
-   post); (b) confirm whether threat2 = gate frame (GATE would be 1001 — it's 1002 ENV, so a
-   real structure past gate 1); (c) reduce bank/turn-brake authority at close range.
-2. **Why doesn't `active_gate` leave 1?** Confirm we actually pass gate 1 vs clip it. If we
-   clip, the both-axes centring band (`CY_ALIGN_BAND`, bearing) may need tightening so we
-   thread the true opening, not the edge.
+1. **Stop missing gate 1 to the RIGHT.** The gate sweeps bearing +5°→−35° on final approach
+   (slides left; we pass on its right edge). We overshoot laterally in the last ~1 m. Ideas,
+   best first: (a) **stronger/earlier lateral correction** — the bank (`KP_ROLL_BEAR`) is the
+   only thing that moves us sideways; a negative bearing at close range means bank LEFT harder
+   to slide back onto centre. Consider scaling bank up as area grows (close range). (b) Slow
+   the final approach more (lower `PITCH_FWD`, wider `TURN_BRAKE`) so centring has time to
+   hold. (c) The gate detection may bias its centroid — check `gates.py` cx at close range in
+   fly_trace (does the reported bearing match the visible opening?). (d) A tiny lateral lead
+   (aim slightly RIGHT of the sweeping gate to counter the leftward drift).
+2. **Then the post-gate-1 hard LEFT S-turn** (next gate at bearing −39°): the sink recurs in
+   the bank (tilt_comp only partly helps). May need to slow through the S and/or raise
+   `NO_GATE_CLIMB` again. Only relevant once gate 1 is actually passed.
 3. **Metric turn trajectory** on ESKF + `guidance.py` once past gate 1 — arrive centred in
    position AND velocity (both validated; guidance has correct rates now).
 4. Then the speed roadmap in `docs/ROADMAP.txt` (racing line/MPCC → 100 Hz → cruise → RL last).
