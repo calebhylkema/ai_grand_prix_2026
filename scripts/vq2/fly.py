@@ -93,7 +93,11 @@ KP_ROLL_BEAR = 0.30  # bank-toward-gate RE-ENABLED 2026-07-02: yaw alone rotates
 #                      The earlier "worse" test was pre-calibration + with the floor-sink;
 #                      flight is stable+calibrated now. Roll sign follows the calibrated
 #                      boundary (desired actual rate); watch fly_trace for the sign.
-MAX_ROLL_TGT = 0.25  # rad (~14 deg) bank clamp — enough to actually turn, still bounded
+MAX_ROLL_TGT = 0.25  # rad (~14 deg) bank clamp — enough to actually turn, still bounded.
+#                      Tried proximity-scaled bank (up to 3x) + 20° clamp to fix the gate-1
+#                      right-miss: WORSE (roll excursions -80°, tumbled EARLIER, still missed).
+#                      The miss is NOT bank authority — likely close-range bearing noise or
+#                      forward speed. Needs frame study, not more bank. Reverted.
 # vertical servo on thrust from the gate's image row (proven values from race.py —
 # thrust was never part of the inversion bug; hover 0.30 re-confirmed on 3379)
 CY_TARGET = 130.0
