@@ -40,7 +40,7 @@ import control_check as cc
 import cv2
 import gates
 import numpy as np
-from estimator import AttitudeEstimator
+from estimator import AttitudeEstimator, VelocityEstimator
 from pymavlink import mavutil
 
 COLL_DUMP_DIR = Path(__file__).resolve().parents[2] / "data" / "vq2" / "fly_collisions"
@@ -50,6 +50,21 @@ cc.CALIBRATE = True
 
 CMD_HZ = 60.0
 HOVER_THRUST = 0.30  # measured (control_check --test hover)
+
+# --- IMU vertical-velocity estimate: DIAGNOSTIC ONLY (do not drive thrust with it) ---
+# 2026-07-02: tried servoing thrust to hold this vz≈0 to stop the post-gate "floor"
+# sink. It made things WORSE (broke gate-0 threading) because the estimate is badly
+# biased through the violent sim launch — it read a CLIMB (vz≈-1 to -2) while the camera
+# frames showed us skimming the floor. Integrated accel is untrustworthy over the launch
+# window; the reliable height cue is the CAMERA (gate image row). vz stays logged only.
+VZ_CLAMP = 3.0  # clamp the logged value so an impact spike doesn't dominate the range
+
+# --- trajectory recorder (self-diagnosis without a human watching the sim) ---
+# Dump a camera frame every TRACE_DT with attitude / vz / gate-detect baked into the
+# filename, so the frame SEQUENCE into a collision can be read back to reconstruct the
+# approach geometry. Cleared at the start of each race run.
+TRACE_DIR = Path(__file__).resolve().parents[2] / "data" / "vq2" / "fly_trace"
+TRACE_DT = 0.15  # seconds between trace frames
 
 # --- outer attitude P loop (desired body rate from attitude error) ---
 KP_ATT_ROLL = 4.0  # rad/s of desired rate per rad of roll error
@@ -63,25 +78,60 @@ MAX_YAW = 1.0  # rad/s
 SEARCH_YAW = 0.4  # rad/s slow scan when no gate visible
 BRAKE_BEAR = 0.5  # rad — taper forward pitch to 0 as |bearing| approaches this
 #                   ("turn in place, then go": no momentum to fight at the turn)
-KP_ROLL_BEAR = 0.0  # bank-toward-gate OFF: live test 2026-07-01 was WORSE with 0.25
-#                     (tilt spikes near gate 1). Verify the roll->translation sign with
-#                     control_check --test translate --calib before re-enabling.
-MAX_ROLL_TGT = 0.12  # rad (~7 deg) bank clamp — gentle by design
+TURN_BRAKE_PITCH = +0.15  # rad nose-up ACTIVE brake when the gate is far off-axis
+#                           (|bearing| > BRAKE_BEAR). Gate 1 is a hard right turn; the
+#                           launch momentum carried us PAST it (bearing pinned +35-40°)
+#                           while yaw ran at max. Kill forward speed so the turn lands.
+CY_ALIGN_BAND = 60.0  # px — "aim then go": only commit forward pitch when the gate is
+#                       vertically centred too (|cy-CY_TARGET|<band). A high gate climbed
+#                       out the TOP of frame (cy 33 -> lost) because we approached faster
+#                       than we climbed and passed UNDER it — brake+climb to centre first.
+KP_ROLL_BEAR = 0.30  # bank-toward-gate RE-ENABLED 2026-07-02: yaw alone rotates where we
+#                      POINT, not where we GO — with ~6 m/s launch momentum the drone slid
+#                      straight past gate 1's right-turn (bearing pinned +38°, fly_trace).
+#                      Banking tilts the thrust vector to pull the velocity into the turn.
+#                      The earlier "worse" test was pre-calibration + with the floor-sink;
+#                      flight is stable+calibrated now. Roll sign follows the calibrated
+#                      boundary (desired actual rate); watch fly_trace for the sign.
+MAX_ROLL_TGT = 0.25  # rad (~14 deg) bank clamp — enough to actually turn, still bounded
 # vertical servo on thrust from the gate's image row (proven values from race.py —
 # thrust was never part of the inversion bug; hover 0.30 re-confirmed on 3379)
 CY_TARGET = 130.0
-KP_THR_PX = 0.10
-THR_MIN, THR_MAX = 0.25, 0.36
-VERT_RANGE_M = 7.0  # only run the descent servo when the gate is close: descending
-#                     toward a far LOW gate drops the drone into intervening dark
-#                     structures (confirmed in data/vq2/fly_collisions frame dumps)
+KP_THR_PX = 0.20  # was 0.10: too weak — a gate high in the frame (cy≈28) commanded only
+#                  ~0.357 thrust, not enough to arrest the launch-arc descent to the floor
+KD_THR_PX = 0.05  # visual D term: damp on d(cy)/dt (px/s, normalised). Climbing makes the
+#                  gate move DOWN the frame (cy rises); without damping the P servo drove
+#                  from floor to the CEILING trusses in ~1.5s (proven in fly_trace). This
+#                  bleeds thrust as the gate approaches centre so we level off, not overshoot.
+THR_MIN, THR_MAX = 0.25, 0.45  # was 0.36: give the climb servo real authority to recover
+# The vertical servo now runs CONTINUOUSLY off the gate's image ROW (PnP range is always
+# nan on 3379, so the old range gate meant it NEVER fired — the drone sank into the floor
+# while the gate climbed out the top of the frame; proven in data/vq2/fly_trace).
+# Asymmetric safety: a gate above center (cy<target) => CLIMB, always allowed (moves away
+# from the floor). A gate below center (cy>target) => DESCEND, allowed only when the gate
+# is clearly CLOSE (large area) so a far LOW gate can't pull us into the floor.
+DESCEND_AREA = 2500.0  # px^2 — only descend toward a gate at least this big in frame
+NO_GATE_CLIMB = 0.015  # thrust bias above hover when no gate is visible: forward flight
+#                        bleeds vertical lift, so hold a mild climb rather than sink blind
 
 # post-gate brake: the launch/cruise carries real momentum and we have no velocity
 # estimate yet, so after each gate pass pitch UP briefly to bleed speed before the turn
 # (live finding 2026-07-01: collisions near gate 1 happen with PERFECT attitude — the
 # failure is entry speed, not stability).
-BRAKE_SECS = 2.2  # 1.2s/+0.14 bled only ~1.6 m/s of an estimated 4-6 m/s of launch
-BRAKE_PITCH = +0.22  # momentum -> still hit the dark structure right of gate 0; ~5 m/s now
+BRAKE_SECS = 0.0  # DISABLED 2026-07-02: the trace proved the gate-1 collision is a SINK
+#                   into the floor, not a lateral structure. The nose-up brake pitched the
+#                   camera into the floor and forced flat thrust during the sink. Off.
+BRAKE_PITCH = +0.22  # (retained; unused while BRAKE_SECS=0)
+
+# post-gate OPEN-SPACE heading hold (2026-07-02): braking alone never changed the
+# ~3.3s collision — the drone rides the launch momentum straight into a dark 3D
+# structure that sits ON the line from the gate-0 exit toward gate 1. The straight-line
+# turn toward gate 1's bearing is what clips it. Instead: after passing gate 0 keep the
+# gate-0 EXIT heading (yaw held, wings level, no gate steering) for HOLD_HEADING_SECS so
+# we coast through the open corridor, THEN acquire gate 1 from past the structure.
+HOLD_HEADING_SECS = 0.0  # DISABLED with the brake (same disproven hypothesis): just
+#                          point-and-go continuously; the vertical servo holds height.
+HOLD_PITCH = -0.03  # (retained; unused while HOLD_HEADING_SECS=0)
 
 # --- failsafes ---
 TILT_ABORT = math.radians(60.0)  # attitude estimator says we're tumbling
@@ -107,6 +157,10 @@ class Flight:
         self.sh, self.conn, self.lock = sh, conn, lock
         self.tgt = (tgt_sys, tgt_comp)
         self.att = AttitudeEstimator()
+        self.vel = VelocityEstimator()
+        self.vz = 0.0  # world-frame descent rate (m/s, +down), IMU-integrated
+        self.vz_min = 0.0  # most-negative (climb) seen
+        self.vz_max = 0.0  # most-positive (sink) seen
         self.t_prev = time.time()
         self.last_arm = 0.0
         with sh.lock:
@@ -131,6 +185,10 @@ class Flight:
         acc = np.array(imu[:3])
         gyro = np.array(imu[3:])
         self.att.update(gyro, acc, dt)
+        self.vel.predict(acc, self.att.R, dt)
+        self.vz = float(np.clip(self.vel.v[2], -VZ_CLAMP, VZ_CLAMP))
+        self.vz_min = min(self.vz_min, self.vz)
+        self.vz_max = max(self.vz_max, self.vz)
         roll, pitch, _ = self.att.euler
         self.tilt_max = max(self.tilt_max, abs(roll), abs(pitch))
         self.gyro_sq_sum += gyro**2
@@ -181,6 +239,7 @@ class Flight:
         return (
             f"tilt_max={math.degrees(self.tilt_max):.1f}deg "
             f"gyro_rms=({rms[0]:.2f},{rms[1]:.2f},{rms[2]:.2f}) "
+            f"vz=[{self.vz_min:+.1f},{self.vz_max:+.1f}]m/s "
             f"coll={coll}{what} active_gate={gate} loops={self.n}"
         )
 
@@ -205,6 +264,38 @@ def stage_hover(fl: Flight, secs: float) -> None:
     print(f"[hover] {fl.summary()}")
 
 
+def vertical_thrust(held: gates.GateTarget | None, cy_rate: float = 0.0) -> float:
+    """Thrust (PD on the gate's image row) that keeps the gate at CY_TARGET.
+
+    Camera image row is the reliable height cue (IMU vz is too biased through the launch).
+    ``cy_rate`` = d(cy)/dt in px/s (the visual climb-rate proxy) damps the overshoot.
+    No gate visible => a mild climb bias, since forward flight bleeds vertical lift.
+    """
+    if held is None:
+        return float(np.clip(HOVER_THRUST + NO_GATE_CLIMB, THR_MIN, THR_MAX))
+    err = (held.cy - CY_TARGET) / 180.0  # <0: gate high => climb; >0: gate low => descend
+    if err >= 0 and held.area < DESCEND_AREA:
+        return HOVER_THRUST  # far low gate: hold, don't dive toward the floor
+    thr = HOVER_THRUST - KP_THR_PX * err - KD_THR_PX * (cy_rate / 180.0)
+    return float(np.clip(thr, THR_MIN, THR_MAX))
+
+
+def _trace_frame(
+    fl: Flight, tdir: Path, t_rel: float, idx: int, held: gates.GateTarget | None, gate: int
+) -> None:
+    """Save one trajectory frame with attitude / vz / gate-detect in the filename."""
+    with fl.sh.lock:
+        frame = fl.sh.frame
+    if frame is None:
+        return
+    roll_d, pitch_d, _ = (math.degrees(v) for v in fl.att.euler)
+    g = "none"
+    if held is not None:
+        g = f"cy{held.cy:.0f}a{held.area:.0f}b{math.degrees(held.bearing):+.0f}"
+    name = f"{idx:03d}_t{t_rel:.2f}_r{roll_d:+.0f}p{pitch_d:+.0f}_vz{fl.vz:+.1f}_g{gate}_{g}.png"
+    cv2.imwrite(str(tdir / name), frame)
+
+
 def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
     """Hover-stabilize, then slow point-and-go toward the nearest gate.
 
@@ -214,11 +305,21 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
     t0 = time.time()
     gate_prev = -1
     brake_until = 0.0
+    hold_until = 0.0  # coast the gate-0 exit heading through the open corridor
     held: gates.GateTarget | None = None  # last validated target (persistence)
     held_at = 0.0
+    prev_cy: float | None = None  # for the visual climb-rate D term
+    prev_cy_t = 0.0
+    cy_rate = 0.0
     coll_seen = 0
     last_sight: tuple[float, float, float] | None = None  # (t_rel, bearing, range)
     reason = "timeout"
+    trace_i = 0
+    trace_next = 0.0
+    if race_mode:  # fresh trajectory-frame corpus for this run
+        TRACE_DIR.mkdir(parents=True, exist_ok=True)
+        for old in TRACE_DIR.glob("*.png"):
+            old.unlink()
     while time.time() - t0 < secs:
         if fl.step_sensors() is None:
             time.sleep(0.002)
@@ -231,7 +332,7 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
         pitch_target = STAB_PITCH if stabilizing else 0.0
         roll_target = 0.0
         yr = 0.0
-        thr = HOVER_THRUST
+        thr = HOVER_THRUST  # proven base (threads gate 0/1); gate-row servo adjusts below
         if not stabilizing:
             with fl.sh.lock:
                 frame = fl.sh.frame
@@ -239,8 +340,11 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
             if gate_now != gate_prev:
                 if race_mode:
                     print(f"  [gate] active_gate -> {gate_now}  t={time.time() - t0:.1f}s")
-                if gate_prev >= 0:  # real gate pass (not the initial 0 latch): brake
+                if gate_prev >= 0:  # real gate pass (not the initial 0 latch)
+                    # coast the exit heading through the open corridor (see HOLD_* note);
+                    # brake first to shed launch momentum, then hold heading.
                     brake_until = time.time() + BRAKE_SECS
+                    hold_until = time.time() + BRAKE_SECS + HOLD_HEADING_SECS
                 gate_prev = gate_now
             with fl.sh.lock:
                 coll_now = fl.sh.collisions - fl.coll0
@@ -253,42 +357,54 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
             if frame is not None:
                 tgt = gates.nearest(frame)
                 if tgt is not None:
-                    held, held_at = tgt, time.time()
+                    now = time.time()
+                    if prev_cy is not None and now > prev_cy_t:  # visual climb-rate (px/s)
+                        cy_rate = (tgt.cy - prev_cy) / (now - prev_cy_t)
+                    prev_cy, prev_cy_t = tgt.cy, now
+                    held, held_at = tgt, now
                     rng = tgt.range_m
                     last_sight = (
-                        time.time() - t0,
+                        now - t0,
                         tgt.bearing,
                         rng if rng is not None else float("nan"),
                     )
             if held is not None and time.time() - held_at > TARGET_HOLD_S:
                 held = None  # sighting stale: stop chasing it
+                cy_rate, prev_cy = 0.0, None  # target dropped: reset the D term
             braking = time.time() < brake_until
             if held is None:
                 yr = SEARCH_YAW  # scan; stay put (pitch level) until we see a REAL gate
             else:
                 bearing = held.bearing
                 yr = float(np.clip(KP_YAW_BEAR * bearing, -MAX_YAW, MAX_YAW))
-                # brake into the turn: forward pitch only when roughly aligned
+                # "aim then go": commit forward pitch only when the gate is centred in
+                # BOTH axes (bearing small AND vertically near CY_TARGET). Otherwise brake
+                # (nose up) and let the yaw/bank turn + climb servo bring it to centre —
+                # the vertical servo holds height meanwhile. Prevents both sliding past a
+                # side gate and passing under a high gate that then exits frame-top.
                 align = max(0.0, 1.0 - abs(bearing) / BRAKE_BEAR)
-                pitch_target = PITCH_FWD * align
+                elev_ok = abs(held.cy - CY_TARGET) < CY_ALIGN_BAND
+                aligned = align > 0.0 and elev_ok
+                pitch_target = PITCH_FWD * align if aligned else TURN_BRAKE_PITCH
                 # gentle bank toward the gate: rotates the velocity vector in turns
                 roll_target = float(np.clip(KP_ROLL_BEAR * bearing, -MAX_ROLL_TGT, MAX_ROLL_TGT))
-                # vertical: image-row servo on the VALIDATED gate only (the old blob
-                # fallback followed floor/wall glow straight into the environment),
-                # and only at close range — far low gates must not trigger an early
-                # descent through whatever stands in between. Far/unknown range: hold.
-                rng = held.range_m
-                if rng is not None and rng < VERT_RANGE_M:
-                    thr = float(
-                        np.clip(
-                            HOVER_THRUST - KP_THR_PX * ((held.cy - CY_TARGET) / 180.0),
-                            THR_MIN,
-                            THR_MAX,
-                        )
-                    )
+            holding = time.time() < hold_until
             if braking:  # bleed post-gate momentum before chasing the next gate
                 pitch_target = BRAKE_PITCH
                 roll_target = 0.0
+                yr = 0.0  # heading locked: do NOT yaw toward gate 1 yet (clips structure)
+            elif holding:  # coast the exit heading through the open corridor past the
+                #            dark structure, THEN resume gate acquisition
+                pitch_target = HOLD_PITCH
+                roll_target = 0.0
+                yr = 0.0
+            # thrust ALWAYS tracks the gate's image row (or a mild climb bias when blind)
+            # — even while braking/holding, which is exactly when the drone was sinking.
+            thr = vertical_thrust(held, cy_rate)
+        if race_mode and time.time() - t0 >= trace_next:
+            _trace_frame(fl, TRACE_DIR, time.time() - t0, trace_i, held, gate_prev)
+            trace_i += 1
+            trace_next = (time.time() - t0) + TRACE_DT
         rr, pr = fl.level_rates(pitch_target, roll_target)
         fl.command(thr, rr, pr, yr)
         time.sleep(dt)

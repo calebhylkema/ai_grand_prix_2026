@@ -1,8 +1,9 @@
 # NEXT SESSION — read this first (standing handoff doc, keep updated)
 
-(Fast catch-up handoff. Deeper detail persists in the memory dir — see
-`project_vq2_rate_calibration.md` ⭐, `feedback_verify_fundamentals_first.md`,
-`project_vq2_session_2026-07-01.md`, `project_vq2_playbook.md`, `project_vq2_drop_findings.md`.)
+Fast catch-up handoff. Deeper detail in the memory dir — see
+`project_vq2_rate_calibration.md` ⭐, `project_vq2_session_2026-07-01b.md` ⭐,
+`project_workspace_reorg_2026-07-01.md`, `feedback_verify_fundamentals_first.md`,
+`project_vq2_playbook.md`, `project_vq2_drop_findings.md`.
 
 ## What this project is
 Python autonomy stack for the **AI Grand Prix 2026** autonomous FPV drone race. We are in
@@ -11,147 +12,151 @@ VQ2 removed ALL ground-truth telemetry (ATTITUDE / LOCAL_POSITION_NED / ODOMETRY
 **We fly from monocular camera + IMU only.** Objective: fastest valid completion → qualify for the
 Sept physical round. VQ2 work is in `scripts/vq2/`. Keep the sim in **Training** for dev.
 
-## ⭐⭐ THE BREAKTHROUGH (2026-07-01) — the multi-day root cause
-For days the drone would thread gate 0, see gate 1, carry its momentum, tumble, and crash — zero
-progress past gate 0. We finally measured the control primitives directly (gyro = ground truth for
-body rate) with the probe `scripts/vq2/control_check.py --test rates`:
+## 🎯 CURRENT STATE (2026-07-02 pm) — where we actually are
+- **Gate 0 threads 100% at t≈2.0s.** Flight is stable (tilt = platform's 17.8° rest pitch
+  until a terminal collision). The multi-day tumble era is OVER.
+- **Active controller is `scripts/vq2/fly.py`.** `race.py` is reference/regression only.
+- **The "gate-0-exit structure" hypothesis was WRONG — it was a FLOOR SINK.** The old
+  collision at t≈3.3s was the drone *sinking into the floor* right after gate 0, NOT a
+  lateral structure. Proven by a new trajectory recorder (below): the gate climbed out the
+  top of the frame while the floor filled the view. The vertical servo that should have
+  climbed never fired (it was range-gated on PnP range, which is ALWAYS nan on 3379).
+- **FIXED this session** → the drone now reaches **gate 1's vicinity at t≈4.5–5.5s** (was
+  3.3s), centring gate 1 in both axes and flying through its plane (bearing sweeps +35°→0→
+  −36° as we pass; gate area explodes then a new small gate is acquired). Big, consistent
+  progress. See "What changed" below.
+- **NEW frontier = a DIFFERENT obstacle at/just past gate 1** (`COLLISION 1002 ENV
+  threat2`, was threat1) at t≈5–5.6s, which knocks the drone tumbling (tilt→80–97° is the
+  RESULT of the impact, not the cause). Also `active_gate` never leaves 1 → gate-1 pass may
+  not be registering cleanly (we may be clipping its frame on the way through).
 
-**Rate commands are INVERTED and ~2.5x scaled.**  `actual_gyro ≈ GAIN * commanded`, with
-`GAIN = (roll -2.55, pitch -2.55, yaw -2.35)`. Linear (verified ±0.4 and ±0.8 rad/s), no cross-coupling.
-So commanding +roll to correct rightward drift rolls the drone the OPPOSITE way 2.5x too hard → every
-correction diverges → tumble. This is why any turn / the geometric controller (which computes
-physically-correct rates) always tumbled, and why race.py is full of hand-tuned sign flips (YAW_SIGN,
-GYRO_INT_SIGN=-1, ROLL_X_SIGN=-1, THR_SIGN=-1) that were partially compensating this by accident.
+## ⭐ What changed in fly.py this session (2026-07-02 pm) — all committed-worthy
+1. **Self-diagnosis tooling (the user's ask: "solve it from the drone's own inputs"):**
+   - **Trajectory recorder** — dumps a camera frame every 0.15s to `data/vq2/fly_trace/`
+     (cleared each run), with attitude / vz / gate cy·area·bearing baked into the filename.
+     Reading the frame SEQUENCE into a collision reconstructs the approach geometry with NO
+     human watching the sim. This is how the floor-sink was found. USE THIS FIRST next time.
+   - **IMU vz** (VelocityEstimator) logged in the summary — but it is **DIAGNOSTIC ONLY**:
+     it read a CLIMB while the camera showed us hitting the floor → integrated accel is too
+     biased through the launch to drive thrust. Do NOT servo thrust on it (tried, broke gate 0).
+2. **Continuous visual vertical servo** (`vertical_thrust`): thrust is a PD on the gate's
+   image ROW (cy→CY_TARGET 130), running EVERY loop (not range-gated). Climb always allowed
+   (safe); descend only when the gate is big/close (`DESCEND_AREA`). D term damps on d(cy)/dt
+   (`KD_THR_PX`) to stop over-climb into the ceiling. `NO_GATE_CLIMB` bias when blind.
+   `KP_THR_PX 0.10→0.20`, `THR_MAX 0.36→0.45`. This is what stopped the floor sink.
+3. **"Aim then go"**: forward pitch only when the gate is centred in BOTH axes (bearing AND
+   cy); otherwise nose-up brake (`TURN_BRAKE_PITCH`) and let yaw+bank+climb centre it first.
+   Stops sliding past a side gate and passing UNDER a high gate (`CY_ALIGN_BAND`).
+4. **Bank-toward-gate RE-ENABLED** (`KP_ROLL_BEAR 0→0.30`, `MAX_ROLL_TGT 0.12→0.25`): yaw
+   rotates where we POINT, banking rotates where we GO — needed to turn onto gate 1 against
+   launch momentum. Verified correct sign in fly_trace (rolled right toward a right gate).
+5. **BRAKE_SECS and HOLD_HEADING_SECS set to 0** (disabled): they were built on the wrong
+   "lateral structure" theory and forced flat thrust during the sink. Constants retained.
 
-**FIX (verified):** invert at the command boundary — `cmd = desired / GAIN` (negate + scale ~0.4).
-`control_check.py --test rates --calib` then shows scale +0.98 (correct sign, ~unity) on all 3 axes.
-Also confirmed **hover thrust ≈ 0.30**.
+## ⭐⭐ The multi-day root cause (2026-07-01) — rate calibration
+The drone tumbled at every turn for days. Measured the control primitives directly (gyro =
+ground truth for body rate) with `scripts/vq2/control_check.py --test rates`:
 
-## 🗂️ 2026-07-01 (later): WORKSPACE REORGANIZED — new paths
-A full audit + reorganization pass was done. If a path from memory 404s, check here:
-- `scripts/` is now **by phase**: `scripts/vq2/` (⭐ active), `scripts/vq1/` (was
-  `scripts/run_race.py` + `scripts/sim_v1/*`), `scripts/pre_sim/` (unchanged).
-- `docs/specs/` holds the official material: `VADR-TS-001_Technical_Spec_VQ1.pdf`,
-  `VADR-TS-003_Technical_Spec_VQ2.pdf` (was `VQ2/Technical_Specifications.pdf`),
-  `vq1_spec.md`, `vq2_spec.md`, `vq2_spec_text.txt`.
-- `docs/PLAN.txt` + `docs/PROGRESS.txt` → merged into **`docs/ROADMAP.txt`** (includes the
-  ordered SPEED roadmap: calibrated control → turn trajectories → racing line/MPCC →
-  100 Hz commands → cruise → perception latency → RL last).
-- Root `MANIFEST.md` → **`docs/CODE_MAP.md`** (per-file map, updated).
-- Deleted: `docs/CHATGPT_RESEARCH.txt` (fully absorbed into RESEARCH.txt), `docs/GSD_SETUP.txt`
-  (GSD was never installed).
-- `scripts/vq2/_archive/` holds superseded scripts: `control_probe.py` (→ control_check.py),
-  `eskf_synthetic_test.py` (→ test_estimation.py, same math as pytest).
-- Captured frames: `VQ2/probe_frames`, `VQ2/recon_frames` → `data/vq2/…` (recon.py updated).
-- `VQ2/` now contains ONLY the sim install (gitignored via anchored `/VQ2/`). `SIMULATOR/` =
-  the OLD VQ1 sim v1.0.3364 — **keep it: it still broadcasts ground truth = estimator
-  validation rig.**
-- Fixed during audit: `config/default.toml` camera now matches the VQ2 spec (fx=fy=320,
-  tilt −20 = 20° UP; was 300/15° fwd). `tests/test_run_race_mpcc_handoff.py` path updated.
-  CLAUDE.md: `control/safety.py` never existed — the MUST-NOT rule now names the inline
-  failsafe logic instead. Full fast suite: **448 passed** after everything.
-- ⚠️ NOTHING IS COMMITTED YET — the whole VQ2 stack + reorg is staged/untracked. First
-  action next session: review `git status`, then commit (branch off master first).
-- Disk note: `runs/` is **8.8 GB / 294k files** (old PPO checkpoints + recorded frames) —
-  prune when convenient; keep `best_model` (@400k) per memory.
+**Rate commands are INVERTED and ~2.5x scaled.** `actual_gyro ≈ GAIN * commanded`,
+`GAIN = (roll -2.55, pitch -2.55, yaw -2.35)`. Linear (verified ±0.4 and ±0.8 rad/s), no
+cross-coupling. Commanding +roll to fix rightward drift rolled the drone the OPPOSITE way 2.5x
+too hard → every correction diverged → tumble. race.py's sign-flip hacks (YAW_SIGN, GYRO_INT_SIGN,
+ROLL_X_SIGN, THR_SIGN) were accidental partial compensation.
 
-## Other findings still valid from earlier 2026-07-01 (pre-breakthrough)
-- ESKF ATTITUDE DIVERGES live (CSV est_pitch −18°→−60° during gate 0) because gate-position updates
-  corrupt attitude + the gravity update is gated off during thrust. It poisoned the geometric guidance.
-  (Real underlying issue was the rate inversion above; the ESKF is a secondary problem.)
-- We decoupled gate≥1 guidance state (accel attitude + PnP-direct pos/vel, bypassing the ESKF) and added
-  a PnP temporal-consistency filter (reject far/jumpy gate detections) in `race.py`. These are still in
-  race.py but race.py itself is now suspect (tuned to the broken rate mapping) — see next steps.
+**FIX (verified):** invert at the command boundary — `cmd = desired / GAIN`. `--test rates --calib`
+then shows scale +0.98 (correct sign, ~unity) on all 3 axes. **Hover thrust ≈ 0.30.**
+`fly.py` applies this at ONE boundary (`cc.CALIBRATE=True` → `control_check.send_att`); every rate
+in fly.py is a *desired actual* body rate. Do NOT retrofit this into race.py (would double-compensate
+its sign hacks and break gate 0).
+
+## ⭐ Perception glow-trap SOLVED (2026-07-02) — gates.py
+Reading the captured collision frames (`runs/vq2_collisions/*.png`, filename = race.py's PnP pose)
+showed the truth: **gates cast a huge diffuse red GLOW on nearby walls/pillars/floor, and both the
+blob centroid AND naive quad fits lock onto the glow** → the drone steered into glow-lit walls.
+Far tiny gates also gave garbage PnP (the old x+13m fly-off "poses").
+
+- **`scripts/vq2/gates.py`** — glow-resistant detection. A gate is a red RING around a non-red core
+  (glow reads solid, core-fill ~0.9, vs a real gate ~0.4); border-touching contours rejected
+  (partial gate → garbage PnP); PnP only from quads ≥800 px²; minAreaRect fallback when the
+  AI-GP banner / perspective breaks the strict 4-vertex fit. Returns `GateTarget` (cx, cy, area,
+  bearing, pose_cam, `.range_m`). `nearest()` = best steering target.
+- Validated OFFLINE over 1118 real frames with **`scripts/vq2/detect_lab.py`** (no sim needed).
+- `fly.py` now steers ONLY on validated gates (0.8s persistence, else scan) — no glow-chasing, and
+  its sighting logs are trustworthy. Vertical descent is range-gated (<7m) so a far LOW gate can't
+  trigger an early descent into whatever's between us and it.
+
+## 🗂️ Workspace layout (reorganized 2026-07-01) — if a memory path 404s, look here
+- `scripts/` is **by phase**: `scripts/vq2/` (⭐ active), `scripts/vq1/` (was `scripts/run_race.py`
+  + `scripts/sim_v1/*`), `scripts/pre_sim/` (unchanged). `scripts/vq2/_archive/` = superseded probes.
+- `docs/specs/` = official material (VADR-TS-001/003 PDFs, vq1/vq2 spec refs).
+- `docs/ROADMAP.txt` = merged PLAN+PROGRESS incl. the ordered SPEED roadmap.
+  `docs/CODE_MAP.md` (was root MANIFEST.md) = per-file map. Deleted CHATGPT_RESEARCH/GSD_SETUP.
+- `SIMULATOR/` = OLD VQ1 sim v1.0.3364 — **KEEP: still broadcasts ground truth = estimator
+  validation rig.** `VQ2/` = the VQ2 sim install only (gitignored `/VQ2/`, anchored).
+- `config/default.toml` camera fixed to VQ2 spec (fx=fy=320, tilt −20 = 20° UP).
 
 ## Where the code is RIGHT NOW
-- `scripts/vq2/control_check.py` — probe suite, our source of truth for control primitives.
-  `--test rates [--rate R] [--calib]`, `--test hover`, `--test translate`. Calibration constants
-  live here: `RATE_GAIN=(-2.55,-2.55,-2.35)`, `desired_to_cmd()`, `CALIBRATE` flag.
-- `scripts/vq2/race.py` — the OLD controller. Threads gate 0 (6/6), tumbles at gate 1. Tuned around
-  the BROKEN rate mapping. Do NOT bake calibration into it blindly — it would double-compensate the
-  existing sign hacks and break gate 0. Reference/regression only.
-- `eskf.py` / `estimator.py` / `guidance.py` unchanged in logic; guidance.py computes CORRECT rates
-  (will finally work once fed calibrated commands + a sane attitude).
+- **`scripts/vq2/fly.py`** — ACTIVE controller. Stages `--stage hover|forward|race`, `--secs`,
+  `--attempts`. Calibrated rates, attitude P-loop (KP=4, MAX_RATE=2), gates.py perception,
+  continuous visual vertical PD servo, aim-then-go + bank turning, failsafes (tilt-abort 60°,
+  collision-abort ≥3, stale-live). Dumps a frame per collision to `data/vq2/fly_collisions/`
+  AND a full trajectory (every 0.15s) to `data/vq2/fly_trace/` (cleared each run) — READ THIS
+  to self-diagnose. `vz=[min,max]` in the summary is a logged-only IMU descent estimate. This
+  is where tuning happens.
+- `scripts/vq2/gates.py` — perception (above).
+- `scripts/vq2/control_check.py` — control-primitive probe + calibration source of truth
+  (`RATE_GAIN`, `desired_to_cmd()`, `CALIBRATE`, `Shared.last_collision`). `--test rates|hover|translate`.
+- `scripts/vq2/detect_lab.py`, `mask_peek.py`, `_lab_gates_check.py` — offline perception lab.
+- `scripts/vq2/eskf.py` / `estimator.py` / `guidance.py` — validated but not yet wired into fly.py.
+  guidance.py computes physically-correct rates (finally usable now that rates are calibrated) —
+  the metric turn-trajectory path once we're past the structure.
+- `scripts/vq2/race.py` — OLD controller, reference only (threads gate 0, tumbles at gate 1;
+  tuned to the broken rate mapping).
 
-## ✅ UPDATE (2026-07-01, later): fly.py BUILT AND LIVE-TESTED — calibrated base PROVEN
-`scripts/vq2/fly.py` (fresh controller, calibration at ONE boundary via
-`control_check.send_att` with `cc.CALIBRATE=True`) was built and flown live. Results:
+## Tried and measured (DON'T redo)
+- The "gate-0-exit structure" was a misdiagnosis — it was a FLOOR SINK (see above). The
+  post-gate pitch-up brake / open-space heading-hold / STAB_PITCH nose-up experiments were
+  all chasing that phantom. Brake + hold are now DISABLED (=0).
+- IMU-integrated vz to hold altitude: BROKE gate 0 (estimate biased through launch). vz is
+  logged-only now. The camera (gate image row) is the reliable height cue.
+- Range-gated vertical servo (`VERT_RANGE_M`): never fired because PnP range is always nan
+  on 3379 → replaced with a continuous image-row PD servo. Removed.
 
-- **The calibrated attitude loop is STABLE.** Level-hover + point-and-go fly with
-  tilt_max = 17.8° (just the platform's own rest pitch — never exceeded) and near-zero
-  roll gyro RMS. Days of tumble are OVER. Failsafes (tilt-abort 60°, collision-abort,
-  stale-live) all verified firing correctly.
-- **Gate 0 threads consistently at t≈2.2s** (~0.7s after the stabilize window) — with
-  physics-correct math, no per-gate tuning needed.
-- **The instrumented gate-1 failure:** ~3s after gate 0, 3–6 collisions, ALL
-  `COLLISION id=1002 (ENVIRONMENT)`, threat 1 — while attitude is PERFECT and the drone
-  is ALIGNED with a red blob (last sighting bearing +2..+12°) but **`range=nan`: the
-  PnP quad does NOT resolve on the gate-1 approach — we steer on the blob fallback with
-  no metric depth** and fly into environment (pillar/wall/floor; gate 1 is the low/right
-  gate, so the cy-thrust servo may also be descending us into the floor).
-- Tried and measured: bank-toward-gate (KP_ROLL_BEAR=0.25) made it WORSE (tilt spikes;
-  now OFF pending a `--test translate --calib` sign check); slower pitch (−0.07) and a
-  1.2s post-gate pitch-up brake did NOT stop the ENV hits alone.
+## → NEXT SESSION, concrete order
+0. **Read the fly_trace first.** `uv run python scripts/vq2/fly.py --stage race --attempts 1`
+   then `ls data/vq2/fly_trace | sort` and Read the last ~8 PNGs (filenames carry
+   t/roll/pitch/vz/gate). This shows the approach into the terminal collision WITHOUT eyes
+   on the sim — it is how the floor sink got solved. Do this before changing anything.
+1. **Beat the threat2 obstacle at/just past gate 1.** From this session's traces we reach
+   gate 1 centred (cy≈130, bearing≈0) at t≈4s then hit ENV threat2 at ~5s. Likely we clip
+   gate 1's own FRAME on the way through (close-range bearing/cy swing hard) or hit a
+   structure immediately beyond it. Ideas: (a) once the gate is BIG+centred (area>~4000)
+   stop steering and commit straight through (freeze roll/yaw so we don't over-bank into the
+   post); (b) confirm whether threat2 = gate frame (GATE would be 1001 — it's 1002 ENV, so a
+   real structure past gate 1); (c) reduce bank/turn-brake authority at close range.
+2. **Why doesn't `active_gate` leave 1?** Confirm we actually pass gate 1 vs clip it. If we
+   clip, the both-axes centring band (`CY_ALIGN_BAND`, bearing) may need tightening so we
+   thread the true opening, not the edge.
+3. **Metric turn trajectory** on ESKF + `guidance.py` once past gate 1 — arrive centred in
+   position AND velocity (both validated; guidance has correct rates now).
+4. Then the speed roadmap in `docs/ROADMAP.txt` (racing line/MPCC → 100 Hz → cruise → RL last).
 
-## ✅ UPDATE 2 (2026-07-02): perception SOLVED, obstacle identified — the frontier moved
-
-Committed: branch `vq2-reorg-calibrated-controller` (reorg + fly.py in 8fd2f90, then
-this session's perception work). `runs/` pruned 8.8 GB → 0.5 GB (kept trained YOLO
-weights `runs/pose/.../best.onnx|pt`, RL `runs/rl_v1/`, all vq2 recordings).
-
-### What was found by LOOKING at the captured frames (Claude can read PNGs!)
-- `runs/vq2_collisions/*.png` (race.py's dumps, filename = PnP pose) show the truth:
-  the gates cast a huge diffuse red GLOW on nearby walls/pillars/floor. **Both the
-  blob centroid AND naive quad fits lock onto glow** → race.py/fly.py steered INTO
-  glow-lit walls. Confirmed frame-by-frame. Far tiny gates also gave garbage PnP
-  locks (the old x+13m "poses").
-- **FIX SHIPPED — `scripts/vq2/gates.py`:** ring-validated detection (a gate is a red
-  RING around a non-red core; glow is SOLID ~0.9 fill vs gate ~0.4; border-touching
-  contours = partial gates rejected; PnP only from quads ≥800 px²; minAreaRect
-  fallback for banner/perspective). Validated offline in `scripts/vq2/detect_lab.py`
-  over 1118 real frames. fly.py now steers ONLY on validated gates (0.8s persistence,
-  else search) — no more glow-chasing, and its sighting logs are now trustworthy.
-- **The remaining blocker is now PHYSICAL, not perceptual:** a huge dark 3D-scanned
-  sloped structure sits right of the gate-0 exit line (see `data/vq2/fly_collisions/`
-  — fly.py dumps a frame on every collision now). The sim LAUNCHES the drone off the
-  platform (~6+ m/s; gate 0 crossed 0.6s after stabilize); ~1.2s later it skims that
-  structure → ENV collisions at t≈3.3s. Consistent 100% of attempts.
-
-### Tried and measured (don't redo)
-- Post-gate pitch-up brake +0.14/1.2s and +0.22/2.2s: collision time unchanged (~3.3s).
-- Nose-up during the launch window (STAB_PITCH +0.10): drone hits the gate-0 FRAME
-  instead of threading (3/3) — ride the launch LEVEL (gate 0 = 100%), brake after.
-- Range-gated descent (VERT_RANGE_M=7, in fly.py): correct idea (stops early descent
-  toward the far low gate) but the dark structure is hit at cruise height too.
-- Bank-toward-gate 0.25: worse (off; sign unverified).
-
-### → NEXT SESSION, concrete order
-1. **Beat the dark structure after gate 0.** Ideas, best first:
-   a. Watch one run with eyes on the sim (the structure's exact geometry decides this);
-   b. steer a fixed OPEN-SPACE heading for ~1.5s after gate 0 (continue gate-0's exit
-      direction, do NOT turn right toward gate 1's bearing yet — the straight-line
-      path to gate 1 clips the structure), THEN acquire gate 1;
-   c. use the optical-flow looming net (race.py `compute_looming`) to veto headings;
-   d. climb over it (hold extra thrust after gate 0, descend only at range<7m — the
-      range-gated descent is already in fly.py).
-2. **Velocity estimate** (ESKF or flow) so braking is closed-loop, not timed.
-3. **Metric turn trajectory** on ESKF + `guidance.py` once past the structure.
-4. Then the speed roadmap in `docs/ROADMAP.txt` (racing line/MPCC → 100 Hz → cruise).
-
-### The offline lab loop (use it — it needs no sim)
-`uv run python scripts/vq2/detect_lab.py [--annotate N] [--glob 'g1_*.png']` scores
-detector variants over the captured frames; `mask_peek.py <frame>` visualizes masks;
-annotated output lands in `data/vq2/lab/`. Claude can Read the PNGs to judge quality.
+## Git / status
+- Branch **`vq2-reorg-calibrated-controller`** (off master). Committed: `8fd2f90` (reorg + fly.py),
+  `9b9622f` (gates.py perception + offline lab). Working tree clean except ongoing tuning.
+- `runs/` pruned 8.8 GB → 0.5 GB (kept `runs/pose/` YOLO best weights, `runs/rl_v1/`, all vq2
+  recordings). `data/vq2/{fly_collisions,lab,recon_frames,probe_frames}` are the frame corpora.
+- Not yet merged to master — do that once the structure is beaten and a full course completes.
 
 ## Norms
-Commit only when the user asks; branch first if on master. Run
-`uv run ruff format . && uv run ruff check --fix .` before any commit. Sim in Training (not
-Qualification) for dev — competitive runs are code-audited.
+Commit only when asked; branch first if on master. `uv run ruff format . && uv run ruff check --fix .`
+before any commit. Sim in **Training** (not Qualification) for dev — competitive runs are code-audited.
 
-## How to run
-From repo root `C:\Users\caleb\Documents\ai_grand_prix` (sim in Training, a run live):
-- Verify control primitives: `uv run python scripts/vq2/control_check.py --test rates` (raw, shows the
-  inversion), then `--test rates --calib` (shows the fix). `--test hover` for hover thrust.
-- Old controller (for reference/regression): `uv run python scripts/vq2/race.py --attempts 5 --max-s 30`.
-- Estimation unit tests: `uv run pytest scripts/vq2/test_estimation.py -q`.
-- Full fast suite: `uv run pytest -m "not simulation" -q`.
+## How to run (repo root `C:\Users\caleb\Documents\ai_grand_prix`, sim in Training, a run live)
+- Fly: `uv run python scripts/vq2/fly.py --stage race --secs 60 --attempts 3`
+  (also `--stage hover` / `--stage forward` to isolate layers).
+- Offline perception (no sim): `uv run python scripts/vq2/detect_lab.py --annotate 8 --glob 'g1_*.png'`
+  → writes annotated frames to `data/vq2/lab/` (Claude can Read the PNGs to judge quality).
+- Verify control primitives: `uv run python scripts/vq2/control_check.py --test rates` (raw inversion),
+  then `--test rates --calib` (the fix); `--test hover`; `--test translate`.
+- Tests: `uv run pytest scripts/vq2/test_estimation.py -q`; full fast suite `uv run pytest -m "not simulation" -q`.
