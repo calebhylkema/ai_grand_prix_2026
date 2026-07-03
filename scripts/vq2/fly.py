@@ -103,8 +103,22 @@ KP_ROLL_BEAR = 0.30  # bank-toward-gate RE-ENABLED 2026-07-02: yaw alone rotates
 MAX_ROLL_TGT = 0.25  # rad (~14 deg) bank clamp — enough to actually turn, still bounded.
 #                      Tried proximity-scaled bank (up to 3x) + 20° clamp to fix the gate-1
 #                      right-miss: WORSE (roll excursions -80°, tumbled EARLIER, still missed).
-#                      The miss is NOT bank authority — likely close-range bearing noise or
-#                      forward speed. Needs frame study, not more bank. Reverted.
+# --- lateral drift damping (2026-07-02): the gate-1 miss is uncontrolled rightward drift.
+# A STATIC gate's de-rotated bearing rate is a lateral-velocity proxy: drift = dβ/dt + gyro_z
+# (rad/s). Validated OFFLINE from a gyro-logged trace — it is cleanly, monotonically negative
+# (rightward drift) from the moment the gate centres. Bank to cancel it: roll += KD * drift
+# (drift<0 => extra LEFT bank). Applied only during the approach; near the pass the bearing
+# rate is parallax-dominated (would over-bank into a tumble), so gate it off by area.
+KD_DRIFT_BANK = 0.0  # DISABLED by default. The drift SIGNAL is validated (offline: cleanly,
+#                      monotonically negative through the gate-1 approach = rightward drift)
+#                      and the sign is right (0.12 pulled bearing -37°→-11°). BUT bank alone
+#                      can't thread gate 1: mild gain is neutral (bearing still ~-35°), strong
+#                      gain tumbles (roll -103°). The approach is too FAST for the lateral
+#                      window. Real fix = slower, velocity-nulled approach (ESKF + guidance);
+#                      this drift proxy is the vision half of that velocity signal. Machinery
+#                      stays wired (drift is computed + traced) so it's ready to turn back on.
+DRIFT_TERM_CLAMP = 0.10  # rad — cap the drift term so it can't dominate/oscillate the bank
+DRIFT_MAX_AREA = 3000.0  # only damp drift below this area (approach, not the parallax pass)
 # vertical servo on thrust from the gate's image row (proven values from race.py —
 # thrust was never part of the inversion bug; hover 0.30 re-confirmed on 3379)
 CY_TARGET = 130.0
@@ -175,6 +189,7 @@ class Flight:
         self.att = AttitudeEstimator()
         self.vel = VelocityEstimator()
         self.vz = 0.0  # world-frame descent rate (m/s, +down), IMU-integrated
+        self.gyro_z = 0.0  # latest body yaw rate (rad/s), for bearing de-rotation
         self.vz_min = 0.0  # most-negative (climb) seen
         self.vz_max = 0.0  # most-positive (sink) seen
         self.t_prev = time.time()
@@ -200,6 +215,7 @@ class Flight:
         self.t_prev = now
         acc = np.array(imu[:3])
         gyro = np.array(imu[3:])
+        self.gyro_z = float(gyro[2])  # body yaw rate — de-rotates gate bearing drift
         self.att.update(gyro, acc, dt)
         self.vel.predict(acc, self.att.R, dt)
         self.vz = float(np.clip(self.vel.v[2], -VZ_CLAMP, VZ_CLAMP))
@@ -313,8 +329,11 @@ def _trace_frame(
     roll_d, pitch_d, _ = (math.degrees(v) for v in fl.att.euler)
     g = "none"
     if held is not None:
-        g = f"cy{held.cy:.0f}a{held.area:.0f}b{math.degrees(held.bearing):+.0f}"
-    name = f"{idx:03d}_t{t_rel:.2f}_r{roll_d:+.0f}p{pitch_d:+.0f}_vz{fl.vz:+.1f}_g{gate}_{g}.png"
+        g = f"cy{held.cy:.0f}a{held.area:.0f}b{math.degrees(held.bearing):+.1f}"
+    name = (
+        f"{idx:03d}_t{t_rel:.2f}_r{roll_d:+.0f}p{pitch_d:+.0f}"
+        f"_vz{fl.vz:+.1f}_gz{fl.gyro_z:+.2f}_g{gate}_{g}.png"
+    )
     cv2.imwrite(str(tdir / name), frame)
 
 
@@ -333,6 +352,9 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
     prev_cy: float | None = None  # for the visual climb-rate D term
     prev_cy_t = 0.0
     cy_rate = 0.0
+    prev_bear: float | None = None  # for the de-rotated lateral-drift proxy
+    prev_bear_t = 0.0
+    drift = 0.0  # dβ/dt + gyro_z (rad/s), + = drifting left, − = drifting right
     coll_seen = 0
     last_sight: tuple[float, float, float] | None = None  # (t_rel, bearing, range)
     reason = "timeout"
@@ -382,7 +404,10 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
                     now = time.time()
                     if prev_cy is not None and now > prev_cy_t:  # visual climb-rate (px/s)
                         cy_rate = (tgt.cy - prev_cy) / (now - prev_cy_t)
+                    if prev_bear is not None and now > prev_bear_t:  # de-rotated drift
+                        drift = (tgt.bearing - prev_bear) / (now - prev_bear_t) + fl.gyro_z
                     prev_cy, prev_cy_t = tgt.cy, now
+                    prev_bear, prev_bear_t = tgt.bearing, now
                     held, held_at = tgt, now
                     rng = tgt.range_m
                     last_sight = (
@@ -392,7 +417,8 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
                     )
             if held is not None and time.time() - held_at > TARGET_HOLD_S:
                 held = None  # sighting stale: stop chasing it
-                cy_rate, prev_cy = 0.0, None  # target dropped: reset the D term
+                cy_rate, prev_cy = 0.0, None  # target dropped: reset the D terms
+                drift, prev_bear = 0.0, None
             braking = time.time() < brake_until
             if held is None:
                 yr = SEARCH_YAW  # scan; stay put (pitch level) until we see a REAL gate
@@ -408,8 +434,16 @@ def stage_forward(fl: Flight, secs: float, race_mode: bool = False) -> str:
                 elev_ok = abs(held.cy - CY_TARGET) < CY_ALIGN_BAND
                 aligned = align > 0.0 and elev_ok
                 pitch_target = PITCH_FWD * align if aligned else TURN_BRAKE_PITCH
-                # gentle bank toward the gate: rotates the velocity vector in turns
-                roll_target = float(np.clip(KP_ROLL_BEAR * bearing, -MAX_ROLL_TGT, MAX_ROLL_TGT))
+                # bank toward the gate (P on bearing) PLUS lateral-drift damping (D on the
+                # de-rotated bearing rate) to cancel the rightward drift that makes us miss
+                # gate 1. Drift damping only during the approach — near the pass the bearing
+                # rate is parallax, and reacting to it over-banks into a tumble.
+                roll_bank = KP_ROLL_BEAR * bearing
+                if held.area < DRIFT_MAX_AREA:
+                    roll_bank += float(
+                        np.clip(KD_DRIFT_BANK * drift, -DRIFT_TERM_CLAMP, DRIFT_TERM_CLAMP)
+                    )
+                roll_target = float(np.clip(roll_bank, -MAX_ROLL_TGT, MAX_ROLL_TGT))
             holding = time.time() < hold_until
             if braking:  # bleed post-gate momentum before chasing the next gate
                 pitch_target = BRAKE_PITCH

@@ -56,6 +56,10 @@ Sept physical round. VQ2 work is in `scripts/vq2/`. Keep the sim in **Training**
 6. **Tilt-compensated thrust** (`Flight.tilt_comp`, `TILT_COMP_MIN_COS`): scale thrust by
    1/(cosR·cosP) using the reliable attitude estimate, so banking a turn doesn't bleed
    altitude — the sink recurred on the hard left turn past gate 1. Marginal help so far.
+7. **Lateral-drift proxy** `drift = dβ/dt + gyro_z` computed every loop + a drift-damped bank
+   term (off by default, see NEXT step 1). Trace filenames now log `gz` (gyro yaw) too.
+8. **Unit tests** `scripts/vq2/test_control.py` (9, all green) lock in `vertical_thrust` +
+   `Flight.tilt_comp`. Run: `uv run pytest scripts/vq2/test_control.py -q`.
 
 ## ⭐⭐ The multi-day root cause (2026-07-01) — rate calibration
 The drone tumbled at every turn for days. Measured the control primitives directly (gyro =
@@ -131,18 +135,24 @@ Far tiny gates also gave garbage PnP (the old x+13m fly-off "poses").
    then `ls data/vq2/fly_trace | sort` and Read the last ~8 PNGs (filenames carry
    t/roll/pitch/vz/gate). This shows the approach into the terminal collision WITHOUT eyes
    on the sim — it is how the floor sink got solved. Do this before changing anything.
-1. **Stop missing gate 1 to the RIGHT — this needs a VELOCITY signal, not more tuning.**
-   CONFIRMED this session: detection is ACCURATE (fly_trace frame 025 t4.10: gate clearly to
-   our left, sitting on the cyan racing line), and the miss is uncontrolled LATERAL (rightward)
-   momentum — we carry sideways velocity that forward-braking can't cancel and bank can't null
-   in time. Position-only (bearing) control overshoots. Tried & REJECTED (don't redo): stronger
-   proximity-scaled bank (tumbled, roll −80°); tighter `BRAKE_BEAR` turn-then-go (bearing still
-   ends −38°). The real fix is a lateral-velocity estimate to damp the drift:
-   - **Optical-flow lateral velocity** from the camera (reliable, unlike IMU integration), OR
-   - wire the already-validated **`eskf.py` + `guidance.py`** (metric turn trajectory: arrive
-     centred in position AND velocity). guidance has correct rates now (calibrated boundary).
-   A bearing-RATE D-term on bank is a lighter middle option but risks close-range parallax
-   over-reaction (the vertical cy-rate D-term worked, so it's worth a careful try).
+1. **Stop missing gate 1 to the RIGHT — needs a SLOWER, velocity-nulled approach.**
+   CONFIRMED this session (multiple experiments): detection is ACCURATE (fly_trace frame 025:
+   gate clearly to our left on the cyan racing line); the miss is uncontrolled LATERAL
+   (rightward) momentum; and **attitude/bank tuning CANNOT fix it** — the approach is too fast
+   for the ~2.5 s lateral-correction window. Tried & REJECTED (don't redo): proximity-scaled
+   bank (tumbled, roll −80°); tighter `BRAKE_BEAR` turn-then-go (bearing still ends −38°);
+   the drift-damped bank below (mild=neutral, strong=tumble roll −103°).
+   - ✅ **VALIDATED DELIVERABLE — the lateral-velocity signal exists and is wired:** a static
+     gate's de-rotated bearing rate `drift = dβ/dt + gyro_z` (rad/s) is a lateral-drift proxy.
+     Offline on a gyro-logged trace it is cleanly, MONOTONICALLY negative through the whole
+     gate-1 approach (= rightward drift), and banking on it with the right sign pulled bearing
+     −37°→−11°. It's computed every loop in `stage_forward` (var `drift`) and gate-logged;
+     `KD_DRIFT_BANK` is the gain (currently 0 = off; `DRIFT_TERM_CLAMP`, `DRIFT_MAX_AREA` bound
+     it). This is the vision half of the velocity estimate — ready to use.
+   - **The real fix:** slow the gate-1 approach WAY down (near-hover: cut launch momentum after
+     gate 0, small `PITCH_FWD`) so the drift correction has time AND doesn't need a violent bank
+     that tumbles; then re-enable `KD_DRIFT_BANK`. OR wire the validated **`eskf.py` +
+     `guidance.py`** for a proper metric approach centred in position AND velocity.
 2. **Then the post-gate-1 hard LEFT S-turn** (next gate at bearing −39°): the sink recurs in
    the bank (tilt_comp only partly helps). May need to slow through the S and/or raise
    `NO_GATE_CLIMB` again. Only relevant once gate 1 is actually passed.
