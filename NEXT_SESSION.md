@@ -131,15 +131,18 @@ Far tiny gates also gave garbage PnP (the old x+13m fly-off "poses").
    then `ls data/vq2/fly_trace | sort` and Read the last ~8 PNGs (filenames carry
    t/roll/pitch/vz/gate). This shows the approach into the terminal collision WITHOUT eyes
    on the sim — it is how the floor sink got solved. Do this before changing anything.
-1. **Stop missing gate 1 to the RIGHT.** The gate sweeps bearing +5°→−35° on final approach
-   (slides left; we pass on its right edge). We overshoot laterally in the last ~1 m. Ideas,
-   best first: (a) **stronger/earlier lateral correction** — the bank (`KP_ROLL_BEAR`) is the
-   only thing that moves us sideways; a negative bearing at close range means bank LEFT harder
-   to slide back onto centre. Consider scaling bank up as area grows (close range). (b) Slow
-   the final approach more (lower `PITCH_FWD`, wider `TURN_BRAKE`) so centring has time to
-   hold. (c) The gate detection may bias its centroid — check `gates.py` cx at close range in
-   fly_trace (does the reported bearing match the visible opening?). (d) A tiny lateral lead
-   (aim slightly RIGHT of the sweeping gate to counter the leftward drift).
+1. **Stop missing gate 1 to the RIGHT — this needs a VELOCITY signal, not more tuning.**
+   CONFIRMED this session: detection is ACCURATE (fly_trace frame 025 t4.10: gate clearly to
+   our left, sitting on the cyan racing line), and the miss is uncontrolled LATERAL (rightward)
+   momentum — we carry sideways velocity that forward-braking can't cancel and bank can't null
+   in time. Position-only (bearing) control overshoots. Tried & REJECTED (don't redo): stronger
+   proximity-scaled bank (tumbled, roll −80°); tighter `BRAKE_BEAR` turn-then-go (bearing still
+   ends −38°). The real fix is a lateral-velocity estimate to damp the drift:
+   - **Optical-flow lateral velocity** from the camera (reliable, unlike IMU integration), OR
+   - wire the already-validated **`eskf.py` + `guidance.py`** (metric turn trajectory: arrive
+     centred in position AND velocity). guidance has correct rates now (calibrated boundary).
+   A bearing-RATE D-term on bank is a lighter middle option but risks close-range parallax
+   over-reaction (the vertical cy-rate D-term worked, so it's worth a careful try).
 2. **Then the post-gate-1 hard LEFT S-turn** (next gate at bearing −39°): the sink recurs in
    the bank (tilt_comp only partly helps). May need to slow through the S and/or raise
    `NO_GATE_CLIMB` again. Only relevant once gate 1 is actually passed.

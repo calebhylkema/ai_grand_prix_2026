@@ -76,8 +76,15 @@ PITCH_FWD = -0.05  # rad, gentle nose-down target => slow forward drift (SLOW fi
 KP_YAW_BEAR = 1.5  # desired yaw rate per rad of bearing to the gate (body frame)
 MAX_YAW = 1.0  # rad/s
 SEARCH_YAW = 0.4  # rad/s slow scan when no gate visible
-BRAKE_BEAR = 0.5  # rad — taper forward pitch to 0 as |bearing| approaches this
-#                   ("turn in place, then go": no momentum to fight at the turn)
+BRAKE_BEAR = 0.22  # rad (~13°) — taper forward pitch to 0 as |bearing| approaches this.
+#                    Was 0.5 (28°). NECESSARY BUT NOT SUFFICIENT for the gate-1 miss:
+#                    tightening it (turn-then-go) did not fix it — bearing still ends at
+#                    -36..-39° (gate to our LEFT) because the real problem is uncontrolled
+#                    LATERAL (rightward) momentum that forward-braking can't cancel and
+#                    moderate bank can't null in time (aggressive bank tumbles). Detection
+#                    is accurate (frame 025 t4.10: gate clearly left, on the racing line).
+#                    The true fix needs a VELOCITY signal (optical flow / ESKF+guidance) to
+#                    null lateral drift — see NEXT_SESSION step 3. Kept tight; it's sound.
 TURN_BRAKE_PITCH = +0.15  # rad nose-up ACTIVE brake when the gate is far off-axis
 #                           (|bearing| > BRAKE_BEAR). Gate 1 is a hard right turn; the
 #                           launch momentum carried us PAST it (bearing pinned +35-40°)
