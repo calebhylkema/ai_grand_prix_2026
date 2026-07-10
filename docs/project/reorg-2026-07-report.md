@@ -42,6 +42,12 @@ All moves used `git mv` — rename detection is 96–100 % throughout, history i
 - `archive/pre_sim/` — pre-simulator stack experiments
 - `archive/vq1/` — the complete VQ1 round (controller, findings)
 - `archive/vq2_experiments/race_v1/` — superseded VQ2 race controller + detect_lab
+- `archive/rounds/vq1/code/mavsdk_adapter.py` (+ its tests) — the legacy MAVSDK
+  adapter, superseded by the pymavlink adapter since 2026-06-01; archiving it also
+  dropped the `mavsdk` dependency. `keyboard` (no active users) and `albumentations`
+  (unused; unbuildable transitive dep on Windows/3.14) were dropped at the same time,
+  and `ultralytics` moved out of core deps (it lives in the `perception` extra;
+  imports are lazy).
 - `archive/` is excluded from ruff, mypy, and pytest; it is reference only.
 
 ## Behavior guarantee
@@ -64,17 +70,17 @@ provenance docstring; the config TOMLs carry the fly2 tuning values verbatim
 ## Verification results (2026-07-10)
 
 - `ruff check` + `ruff format`: clean (archive excluded)
-- `pytest`: **492 passed** (baseline before reorg: 444; the delta is the migrated
-  VQ2 unit tests)
-- `mypy src/drone_racing`: **23 errors — identical to the pre-reorg baseline**, all
-  in the pre-sim lineage library (numpy/cv2/mavsdk stub friction); zero in the VQ2
-  deployment
+- `pytest`: **466 passed** (baseline before reorg: 444; migrated VQ2 unit tests
+  added, the 26 legacy MAVSDK-adapter tests archived with their module)
+- `mypy src/drone_racing`: **11 errors** (was 23 pre-reorg; archiving the
+  superseded MAVSDK adapter removed 12), all in the pre-sim lineage library
+  (numpy/cv2 stub friction); zero in the VQ2 deployment
 - `uv build`: sdist + wheel build clean
 - All five console scripts (`aigp-vq2`, `aigp-calibrate`, `aigp-replay`,
   `aigp-train-detector`, `aigp-benchmark`) pass `--help`
 - Both deployment configs load through the typed loader
 - No `sys.path` hacks and no old sibling imports outside `archive/`
-- Coverage 68 % measured / gate at 65 (see debt below)
+- Coverage 69 % measured / gate at 65 (see debt below)
 
 ## Remaining structural debt
 
@@ -82,10 +88,9 @@ provenance docstring; the config TOMLs carry the fly2 tuning values verbatim
    on package imports and stays until a gate-0 run reproduces the baseline
    (100 % thread @ ~2.2 s), proving the runtime.py extraction. Then it moves to
    `archive/vq2_experiments/reactive_fly/`.
-2. **23 pre-existing mypy errors** in `utils/transforms`, `perception/neural`,
-   `perception/classical`, `logging/flight_logger`, `sim/mavsdk_adapter`,
-   `sim/mavlink_adapter`, `control/rl_env`. CI runs mypy non-blocking until burned
-   down.
+2. **11 pre-existing mypy errors** in `utils/transforms`, `perception/neural`,
+   `perception/classical`, `logging/flight_logger`, `sim/mavlink_adapter`,
+   `control/rl_env`. CI runs mypy non-blocking until burned down.
 3. **Coverage gate at 65 % (target 80).** The gap is the untested pre-sim lineage
    library (`training/`, `cli/`, sim adapters). Live-sim-loop VQ2 modules
    (mission/runtime/calibration/diagnostics) are omitted from measurement — they

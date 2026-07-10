@@ -62,7 +62,10 @@ mandatory stack for the physical qualifier.
 | `planning/` | pre-sim | next up on the speed roadmap |
 | `control/` | pre-sim | RL best_model @400k usable; PID gains were mock-sim tuned |
 | `sim/mavlink_adapter.py` | vq1 | live pymavlink adapter + RACE_STATUS/vision parsing |
-| `sim/mavsdk_adapter.py`, `mock_adapter.py` | pre-sim | legacy MAVSDK path + offline mock |
+| `sim/mock_adapter.py` | pre-sim | offline mock for adapter-contract tests |
+
+(The legacy MAVSDK adapter was archived to `archive/rounds/vq1/code/` on 2026-07-10 —
+superseded by the pymavlink adapter since 2026-06-01.)
 
 ## Control interface (verified on v1.0.3379)
 

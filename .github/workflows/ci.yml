@@ -33,8 +33,8 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check .
 
-      # 23 pre-existing errors in the pre-sim lineage library (numpy/cv2/mavsdk
-      # stub friction) — tracked as reorg debt; non-blocking until burned down.
+      # 11 pre-existing errors in the pre-sim lineage library (numpy/cv2 stub
+      # friction) — tracked as reorg debt; non-blocking until burned down.
       - name: Mypy type check
         run: uv run mypy src/drone_racing
         continue-on-error: true

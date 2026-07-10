@@ -1,1 +1,1 @@
-"""Simulator adapters — mock (offline testing) and MAVSDK (real sim)."""
+"""Simulator adapters — mock (offline testing) and pymavlink (real sim)."""
