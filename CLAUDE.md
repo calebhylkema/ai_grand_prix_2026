@@ -26,7 +26,7 @@ src/drone_racing/          installed package (import name: drone_racing)
   perception|estimation|planning|control/   pre-sim-lineage library modules
   training/  cli/          training logic + console entry points
 deployments/vq2/           configs (training.toml / qualification.toml) + course maps
-tests/                     unit/ integration/ replay/vq2/ simulation/
+tests/                     unit/ integration/ (replay + simulation suites: future)
 docs/                      Diátaxis docs — index.md, project/status.md ⭐
 archive/                   historical rounds + superseded controllers — NOT active,
                            excluded from all tooling, never "fix" it

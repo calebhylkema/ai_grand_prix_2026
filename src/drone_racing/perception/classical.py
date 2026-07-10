@@ -27,6 +27,8 @@ import numpy as np
 from drone_racing.utils.types import GateDetection
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from drone_racing.utils.types import CameraConfig
 
 logger = logging.getLogger(__name__)
@@ -346,7 +348,7 @@ class ClassicalDetector:
 
     def _find_inner_corners(
         self,
-        contours: list[np.ndarray],
+        contours: Sequence[np.ndarray],
         hierarchy: np.ndarray | None,
         parent_idx: int,
         outer_corners: np.ndarray,

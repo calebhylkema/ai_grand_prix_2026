@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -306,7 +307,7 @@ class NeuralDetector:
 
     def __init__(self, config: NeuralDetectorConfig | None = None) -> None:
         self._cfg = config or NeuralDetectorConfig()
-        self._session = None
+        self._session: Any = None  # ort.InferenceSession once loaded (ort is untyped)
         self._input_name: str = ""
         self._output_names: list[str] = []
         self._loaded = False

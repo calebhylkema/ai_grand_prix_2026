@@ -8,12 +8,11 @@ allowed-tools:
 
 Run the project test suite using `uv run pytest -v --tb=short`. This collects:
 
-- `tests/unit/` — subsystem unit tests (including VQ2 deployment tests)
+- `tests/unit/` — subsystem unit tests (`unit/vq2/` holds the VQ2 deployment tests)
 - `tests/integration/` — multi-component pipeline tests
-- `tests/replay/vq2/` — saved-frame / recorded-transition tests
 
-Live-simulator tests in `tests/simulation/` are marked `simulation` and excluded by
-default; `archive/` is never collected.
+Tests marked `simulation` require the live simulator and are excluded by default;
+`archive/` is never collected.
 
 If any tests fail:
 

@@ -81,7 +81,7 @@ disallow_untyped_defs = true
 exclude = ["archive/"]
 
 [[tool.mypy.overrides]]
-module = ["cv2.*", "casadi.*", "onnxruntime.*", "ultralytics.*", "scipy.*", "pymavlink.*"]
+module = ["cv2.*", "casadi.*", "onnxruntime.*", "ultralytics.*", "scipy.*", "pymavlink", "pymavlink.*"]
 ignore_missing_imports = true
 
 # The VQ2 deployment migrated from flight-validated scripts (2026-07-09 reorg).
@@ -119,9 +119,9 @@ omit = [
 ]
 
 [tool.coverage.report]
-# Current honest floor (2026-07-10 reorg): 67% measured; the gap is the pre-sim
+# Current honest floor (2026-07-10 reorg): 70.7% measured; the gap is the pre-sim
 # lineage library (training/, cli/, sim adapters) with no unit tests. Target: 80.
-fail_under = 65
+fail_under = 68
 
 [dependency-groups]
 dev = [

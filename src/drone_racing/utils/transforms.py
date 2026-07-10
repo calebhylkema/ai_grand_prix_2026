@@ -96,7 +96,7 @@ def quat_ned_to_enu(q_ned: Vec4) -> Vec4:
     q_frame = Rotation.from_matrix(r_enu_ned).as_quat()
     r_body = Rotation.from_quat(q_ned)
     r_enu = Rotation.from_quat(q_frame) * r_body
-    return r_enu.as_quat().astype(np.float64)
+    return np.asarray(r_enu.as_quat(), dtype=np.float64)
 
 
 def quat_enu_to_ned(q_enu: Vec4) -> Vec4:
@@ -117,7 +117,7 @@ def quat_enu_to_ned(q_enu: Vec4) -> Vec4:
     q_frame = Rotation.from_matrix(r_ned_enu).as_quat()
     r_body = Rotation.from_quat(q_enu)
     r_ned = Rotation.from_quat(q_frame) * r_body
-    return r_ned.as_quat().astype(np.float64)
+    return np.asarray(r_ned.as_quat(), dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------

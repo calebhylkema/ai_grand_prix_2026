@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -171,7 +171,7 @@ class FlightLogger:
         cmd_ts, cmd_data = self._commands.to_arrays()
         gt_ts, gt_data = self._ground_truth.to_arrays()
 
-        save_dict: dict[str, object] = {
+        save_dict: dict[str, Any] = {
             "state_timestamps_ns": state_ts,
             "state_data": state_data,
             "command_timestamps_ns": cmd_ts,

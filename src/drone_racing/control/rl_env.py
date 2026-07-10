@@ -404,7 +404,7 @@ class DroneRacingEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         return obs
 
-    def render(self) -> np.ndarray | None:
+    def render(self) -> np.ndarray | None:  # type: ignore[override]  # gymnasium's RenderFrame TypeVar
         """Return an RGB frame from the mock sim camera.
 
         Returns
@@ -414,5 +414,5 @@ class DroneRacingEnv(gym.Env[np.ndarray, np.ndarray]):
         """
         result = self._sim.get_frame()
         if result is not None:
-            return result[0]  # type: ignore[return-value]
+            return result[0]
         return None

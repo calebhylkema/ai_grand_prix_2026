@@ -14,14 +14,15 @@ src/drone_racing/        installed package (import name: drone_racing)
   estimation/            16-state ESKF + gate mapper (pre-sim lineage)
   planning/              B-spline racing line + MPCC (p95 22 ms warm-started)
   control/               PID cascade, RL policy, MPCC adapter, rate limiter
-  sim/                   sim adapters: pymavlink (live), MAVSDK (legacy), mock
+  sim/                   sim adapters: pymavlink (live), mock (offline)
   logging/               flight logger + frame recorder
   utils/                 config, transforms, types
   training/              gate-detector / RL / data-generation training entry logic
   deployments/vq2/       ⭐ ACTIVE deployment (see below)
   cli/                   console-script entry points (aigp-*)
 deployments/vq2/         deployment data: configs + course maps
-tests/                   unit / integration / replay/vq2 / simulation
+tests/                   unit/ (incl. unit/vq2/) + integration/; replay + live-sim
+                         suites are planned, added when they gain content
 archive/                 historical rounds + superseded VQ2 controllers (not in CI)
 .local/                  simulators, datasets, models, runs, logs (gitignored)
 ```

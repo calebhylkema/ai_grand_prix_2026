@@ -70,17 +70,18 @@ provenance docstring; the config TOMLs carry the fly2 tuning values verbatim
 ## Verification results (2026-07-10)
 
 - `ruff check` + `ruff format`: clean (archive excluded)
-- `pytest`: **466 passed** (baseline before reorg: 444; migrated VQ2 unit tests
-  added, the 26 legacy MAVSDK-adapter tests archived with their module)
-- `mypy src/drone_racing`: **11 errors** (was 23 pre-reorg; archiving the
-  superseded MAVSDK adapter removed 12), all in the pre-sim lineage library
-  (numpy/cv2 stub friction); zero in the VQ2 deployment
+- `pytest`: **481 passed** (baseline before reorg: 444; migrated VQ2 unit tests
+  added, new config-loader + workspace tests added, the 26 legacy MAVSDK-adapter
+  tests archived with their module)
+- `mypy src/drone_racing`: **clean** (was 23 errors pre-reorg; 12 removed by
+  archiving the superseded MAVSDK adapter, the remaining 11 numpy/cv2-stub
+  frictions fixed 2026-07-10) — now a blocking CI step
 - `uv build`: sdist + wheel build clean
 - All five console scripts (`aigp-vq2`, `aigp-calibrate`, `aigp-replay`,
   `aigp-train-detector`, `aigp-benchmark`) pass `--help`
 - Both deployment configs load through the typed loader
 - No `sys.path` hacks and no old sibling imports outside `archive/`
-- Coverage 69 % measured / gate at 65 (see debt below)
+- Coverage 70.7 % measured / gate at 68 (see debt below)
 
 ## Remaining structural debt
 
@@ -88,17 +89,12 @@ provenance docstring; the config TOMLs carry the fly2 tuning values verbatim
    on package imports and stays until a gate-0 run reproduces the baseline
    (100 % thread @ ~2.2 s), proving the runtime.py extraction. Then it moves to
    `archive/vq2_experiments/reactive_fly/`.
-2. **11 pre-existing mypy errors** in `utils/transforms`, `perception/neural`,
-   `perception/classical`, `logging/flight_logger`, `sim/mavlink_adapter`,
-   `control/rl_env`. CI runs mypy non-blocking until burned down.
-3. **Coverage gate at 65 % (target 80).** The gap is the untested pre-sim lineage
+2. **Coverage gate at 68 % (target 80).** The gap is the untested pre-sim lineage
    library (`training/`, `cli/`, sim adapters). Live-sim-loop VQ2 modules
    (mission/runtime/calibration/diagnostics) are omitted from measurement — they
    need the running simulator.
-4. **Flat legacy tests** (`tests/test_*.py`) not yet bucketed into
-   `unit/ | integration/ | simulation/`.
-5. **mypy relaxations for `drone_racing.deployments.vq2.*`** (untyped defs,
+3. **mypy relaxations for `drone_racing.deployments.vq2.*`** (untyped defs,
    any-generics, return-any) — converge to package strictness over time; do not let
    it spread.
-6. CI runs on ubuntu and cannot exercise the Windows-only simulator; simulation
+4. CI runs on ubuntu and cannot exercise the Windows-only simulator; simulation
    tests are excluded there by marker.
