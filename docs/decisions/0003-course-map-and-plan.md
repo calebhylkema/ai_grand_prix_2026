@@ -30,10 +30,10 @@ Forensics on the AX batch found the structural cause, not a tuning cause:
   ~9° above body-horizontal. Gate 1 is ~0.6 m above gate 0's center, and we cross
   gate 0 sinking — the real gate 1 is physically out of frame (top) exactly when the
   reactive stack needs it, while the 21–23 m imposters are in frame.
-- The learning-guide audit (`learning-guides/autonomous-drones-mastery.md` §14)
-  found the one architecture box absent from the active stack: a gate map feeding a
-  planner. State-of-the-art monocular racing systems (MonoRace, Swift) all fly a
-  pre-built track map; perception corrects the plan rather than generating it.
+- A full-pipeline audit found the one architecture box absent from the active
+  stack: a gate map feeding a planner. State-of-the-art monocular racing systems
+  (MonoRace, Swift) all fly a pre-built track map; perception corrects the plan
+  rather than generating it.
 
 The course is FIXED per event and Training attempts are unlimited, so map data is
 free: any saved trace frame with TWO PnP-valid gates yields their relative position

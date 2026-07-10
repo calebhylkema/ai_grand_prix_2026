@@ -34,8 +34,3 @@ Organized by the [Diátaxis](https://diataxis.fr/) model.
 
 Active architecture decision records in [decisions/](decisions/). Round-specific or
 superseded decisions live with their round in `archive/`.
-
-## Tutorials
-
-- [Autonomous drones mastery](tutorials/autonomous-drones-mastery.md) — from-zero
-  learning guide (generated HTML/PDF builds go to `.local/docs-build/`)
