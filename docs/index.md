@@ -6,6 +6,7 @@ Organized by the [Diátaxis](https://diataxis.fr/) model.
 
 - **[Status](project/status.md)** ⭐ — the single authoritative "where are we" doc
 - [Roadmap](project/roadmap.md) — future work by competition phase
+- [Reorg report 2026-07](project/reorg-2026-07-report.md) — migration record: old→new paths, debt
 
 ## How-to guides
 
