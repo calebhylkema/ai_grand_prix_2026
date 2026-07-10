@@ -23,9 +23,10 @@ from the clean platform pose. Short bursts only (low-ceiling room).
 
 Usage
 -----
-    uv run python scripts/vq2/control_check.py --test rates
-    uv run python scripts/vq2/control_check.py --test hover
-    uv run python scripts/vq2/control_check.py --test translate
+    uv run aigp-calibrate --test rates
+    uv run aigp-calibrate --test hover
+    uv run aigp-calibrate --test translate
+    uv run aigp-calibrate --test rates --calib   # verify the calibrated boundary
 """
 
 from __future__ import annotations
@@ -338,7 +339,9 @@ def test_hover(sh, conn, tgt_sys, tgt_comp, lock) -> None:
 def _flow_dir(prev: np.ndarray, cur: np.ndarray) -> tuple[float, float]:
     """Mean optical-flow vector (px). +u = scene moves right, +v = scene moves down.
     Scene moving right ⇒ drone translating LEFT (and vice versa)."""
-    flow = cv2.calcOpticalFlowFarneback(prev, cur, None, 0.5, 2, 15, 3, 5, 1.2, 0)
+    flow = cv2.calcOpticalFlowFarneback(  # type: ignore[call-overload]  # stubs reject flow=None
+        prev, cur, None, 0.5, 2, 15, 3, 5, 1.2, 0
+    )
     return float(flow[..., 0].mean()), float(flow[..., 1].mean())
 
 
@@ -406,18 +409,18 @@ def test_translate(sh, conn, tgt_sys, tgt_comp, lock) -> None:
         time.sleep(1.0 / CMD_HZ)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="VQ2 control characterization probes.")
     ap.add_argument("--test", choices=["rates", "hover", "translate"], required=True)
     ap.add_argument("--rate", type=float, default=0.8, help="rate-step magnitude (rad/s)")
     ap.add_argument(
         "--calib", action="store_true", help="apply measured rate calibration (expect scale ~+1.0)"
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     global CALIBRATE
     CALIBRATE = args.calib
     with contextlib.suppress(Exception):  # Windows consoles default to cp1252
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 
     print(f"Connecting to {MAVLINK_ENDPOINT} …")
     conn = mavutil.mavlink_connection(MAVLINK_ENDPOINT)

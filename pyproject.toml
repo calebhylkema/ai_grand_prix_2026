@@ -83,7 +83,7 @@ disallow_untyped_defs = true
 exclude = ["archive/"]
 
 [[tool.mypy.overrides]]
-module = ["cv2.*", "casadi.*", "onnxruntime.*", "ultralytics.*", "scipy.*"]
+module = ["cv2.*", "casadi.*", "onnxruntime.*", "ultralytics.*", "scipy.*", "pymavlink.*"]
 ignore_missing_imports = true
 
 # The VQ2 deployment migrated from flight-validated scripts (2026-07-09 reorg).
@@ -93,6 +93,8 @@ module = ["drone_racing.deployments.vq2.*"]
 disallow_untyped_defs = false
 disallow_untyped_calls = false
 disallow_incomplete_defs = false
+disallow_any_generics = false
+warn_return_any = false
 check_untyped_defs = true
 
 [tool.pytest.ini_options]

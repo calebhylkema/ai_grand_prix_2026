@@ -1,29 +1,40 @@
-"""VQ2 telemetry recon — passively observe what the sim actually streams.
+"""VQ2 diagnostics: passive telemetry recon + offline perception lab.
 
-Run this with the sim in **Training** mode and a run started. It listens on the
-MAVLink UDP port and the vision UDP port for a fixed duration, then reports:
+Two subcommands:
+
+``recon`` — passively observe what the sim actually streams. Run with the sim in
+**Training** mode and a run started. Listens on the MAVLink UDP port and the
+vision UDP port for a fixed duration, then reports:
 
 - which MAVLink message types arrived, with counts and approximate rates
 - a sample HIGHRES_IMU reading (accel + gyro)
 - a sample RACE_STATUS (active gate index, timing)
 - whether TRACK_INFO gate pose/size fields are nulled (as the VQ2 spec claims)
-- saves the first few complete camera frames to ``data/vq2/recon_frames/`` as PNGs
+- saves the first few complete camera frames to ``.local/datasets/vq2/recon_frames/``
 
 Nothing is armed and no control commands are sent — purely read-only, so it is
 safe to run against any mode. Heartbeats are emitted so the sim keeps streaming.
 
+``lab`` — run the CURRENT perception module (``perception.detect`` +
+``perception.detect_line``) offline over a directory of saved frames (collision
+dumps, trace archives) and report per-frame detections; optionally write
+annotated copies for eyeballing. Replaces the archived race_v1 detect_lab.
+
 Usage
 -----
-    uv run python scripts/vq2/recon.py            # 20 s capture
-    uv run python scripts/vq2/recon.py 30         # 30 s capture
+    uv run python -m drone_racing.deployments.vq2.diagnostics recon           # 20 s
+    uv run python -m drone_racing.deployments.vq2.diagnostics recon --secs 30
+    uv run python -m drone_racing.deployments.vq2.diagnostics lab             # collision dumps
+    uv run python -m drone_racing.deployments.vq2.diagnostics lab DIR --annotate 20
 """
 
 from __future__ import annotations
 
+import argparse
 import collections
+import math
 import socket
 import struct
-import sys
 import threading
 import time
 from pathlib import Path
@@ -32,14 +43,24 @@ import cv2
 import numpy as np
 from pymavlink import mavutil
 
+from drone_racing.deployments.vq2 import perception
+from drone_racing.utils.workspace import Workspace
+
 MAVLINK_ENDPOINT = "udpin:127.0.0.1:14550"
 VISION_IP = "0.0.0.0"
 VISION_PORT = 5600
 VISION_HEADER = "<IHHIIQ"
-FRAME_DIR = Path(__file__).resolve().parents[2] / "data" / "vq2" / "recon_frames"
 MAX_FRAMES_TO_SAVE = 5
 
+_WS = Workspace.locate()
+FRAME_DIR = _WS.datasets / "vq2" / "recon_frames"
+LAB_DEFAULT_DIR = _WS.runs / "vq2_collisions"
+LAB_OUT_DIR = _WS.datasets / "vq2" / "lab"
 
+
+# ---------------------------------------------------------------------------
+# recon
+# ---------------------------------------------------------------------------
 def vision_listener(stop: threading.Event, saved: list[int]) -> None:
     """Reassemble chunked JPEG frames from UDP 5600 and save a handful as PNG."""
     header_sz = struct.calcsize(VISION_HEADER)
@@ -82,9 +103,8 @@ def vision_listener(stop: threading.Event, saved: list[int]) -> None:
     print(f"[vision] complete frames decoded: {count}")
 
 
-def main() -> None:
-    duration = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
-
+def recon(duration: float) -> None:
+    """Passive MAVLink + vision capture; report message types and key samples."""
     print(
         f"Connecting to {MAVLINK_ENDPOINT} … (make sure the sim is in Training and a run is live)"
     )
@@ -174,6 +194,81 @@ def main() -> None:
 
     print(f"\nCamera frames saved: {len(saved)} → {FRAME_DIR}")
     print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# lab
+# ---------------------------------------------------------------------------
+def lab(frames_dir: Path, annotate: int) -> None:
+    """Run the current perception stack offline over saved frames and report."""
+    files = sorted(p for p in frames_dir.glob("*.png")) + sorted(frames_dir.glob("*.jpg"))
+    if not files:
+        print(f"No frames (*.png / *.jpg) in {frames_dir}")
+        return
+    print(f"{len(files)} frames from {frames_dir}")
+    n_gate = n_posed = n_line = 0
+    annotated = 0
+    if annotate:
+        LAB_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        img = cv2.imread(str(f))
+        if img is None:
+            continue
+        dets = perception.detect(img)
+        line = perception.detect_line(img)
+        if dets:
+            n_gate += 1
+            n_posed += any(t.pose_cam is not None for t in dets)
+        if line is not None:
+            n_line += 1
+        parts = []
+        for t in dets:
+            z = f" z{t.pose_cam[2]:.1f}m" if t.pose_cam is not None else ""
+            parts.append(f"gate cy{t.cy:.0f} a{t.area:.0f} b{math.degrees(t.bearing):+.0f}deg{z}")
+        if line is not None:
+            parts.append(f"line aim b{math.degrees(line.aim_bearing):+.0f}deg y{line.aim_cy:.0f}")
+        print(f"  {f.name}: {'; '.join(parts) if parts else '(nothing)'}")
+        if annotate and annotated < annotate:
+            vis = img.copy()
+            for t in dets:
+                cv2.circle(vis, (int(t.cx), int(t.cy)), 6, (0, 255, 0), 2)
+            if line is not None:
+                cv2.circle(vis, (int(line.aim_cx), int(line.aim_cy)), 5, (255, 255, 0), 2)
+            cv2.imwrite(str(LAB_OUT_DIR / f.name), vis)
+            annotated += 1
+    print(
+        f"\nSummary: gates in {n_gate}/{len(files)} frames ({n_posed} with PnP pose), "
+        f"racing line in {n_line}/{len(files)}"
+    )
+    if annotated:
+        print(f"Annotated {annotated} frames → {LAB_OUT_DIR}")
+
+
+# ---------------------------------------------------------------------------
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="VQ2 diagnostics: telemetry recon + perception lab.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    ap_recon = sub.add_parser("recon", help="passively observe what the sim streams")
+    ap_recon.add_argument("--secs", type=float, default=20.0, help="capture duration (s)")
+
+    ap_lab = sub.add_parser("lab", help="run perception offline over saved frames")
+    ap_lab.add_argument(
+        "frames_dir",
+        nargs="?",
+        type=Path,
+        default=LAB_DEFAULT_DIR,
+        help=f"directory of frames (default: {LAB_DEFAULT_DIR})",
+    )
+    ap_lab.add_argument(
+        "--annotate", type=int, default=0, metavar="N", help="write N annotated frames to lab dir"
+    )
+
+    args = ap.parse_args(argv)
+    if args.cmd == "recon":
+        recon(args.secs)
+    else:
+        lab(args.frames_dir, args.annotate)
 
 
 if __name__ == "__main__":

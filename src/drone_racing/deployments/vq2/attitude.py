@@ -118,7 +118,11 @@ class AttitudeEstimator:
             omega = omega + self.kp * w_acc * err
             # validation: instantaneous gravity-alignment error (deg), steady windows only
             if w_acc > 0.5:
-                ang = np.degrees(np.arcsin(min(1.0, np.linalg.norm(np.cross(a_hat, up_body)))))
+                ang = np.degrees(
+                    np.arcsin(  # type: ignore[call-overload]  # numpy-stub friction w/ min()
+                        min(1.0, np.linalg.norm(np.cross(a_hat, up_body)))
+                    )
+                )
                 self._grav_err_sum += ang
                 self._grav_err_n += 1
         # integrate quaternion: q_dot = 0.5 * q ⊗ [0, omega]

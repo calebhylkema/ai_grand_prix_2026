@@ -4,11 +4,12 @@
 
 Accepted (2026-07-09). Supersedes the reactive-branch approach of the old `fly.py`
 controller for course navigation. (2026-07-09 restructure note: the reactive
-controller is archived at `archive/vq2_experiments/reactive_fly/`; its proven
-low-level primitives — calibrated rates, Flight failsafes, CY vertical servo — were
-extracted into `drone_racing.deployments.vq2.runtime`. The mission executor
-described below is `drone_racing.deployments.vq2.mission`, run as `aigp-vq2`; the
-course-map miner is `drone_racing.deployments.vq2.mapping`.)
+controller stays runnable at `scripts/vq2/fly.py` until a live gate-0 regression
+revalidates the extraction, then moves to `archive/vq2_experiments/reactive_fly/`;
+its proven low-level primitives — calibrated rates, Flight failsafes, CY vertical
+servo — were extracted into `drone_racing.deployments.vq2.runtime`. The mission
+executor described below is `drone_racing.deployments.vq2.mission`, run as
+`aigp-vq2`; the course-map miner is `drone_racing.deployments.vq2.mapping`.)
 
 ## Context
 
@@ -41,12 +42,13 @@ roll/pitch leveling — the vertical component and separation are yaw-invariant)
 
 ## Decision
 
-1. **Offline course mapping** (`scripts/vq2/course_map.py`): mine all saved
-   fly_trace archives for PnP-valid gate observations and co-visible pairs; write
-   `data/vq2/map/observations.csv`. Map v0 (3 independent co-visible pairs across
+1. **Offline course mapping** (`drone_racing.deployments.vq2.mapping`): mine all
+   saved fly_trace archives for PnP-valid gate observations and co-visible pairs;
+   write `.local/datasets/vq2/map/observations.csv`. Map v0 (3 independent co-visible pairs across
    6 runs): gate 1 is 9.2 m fwd / 6.4 m right of gate 0 (34.8° right, 11.2 m
    horizontal), +0.6 m up; post-crossing sightings at z 21–23 m are gate 2.
-2. **Map-based mission executor** (`scripts/vq2/fly2.py`): phased plan instead of
+2. **Map-based mission executor** (`drone_racing.deployments.vq2.mission`,
+   run as `aigp-vq2`): phased plan instead of
    per-frame re-decision — thread gate 0 (proven servo), then on the RACE_STATUS
    gate-pass event: BRAKE hard (deep flare; we exit the catapulted gate-0 pass hot)
    while CLIMBING ~2 m (so the 20°-down camera can see the elevated gate 1), SCAN
@@ -58,7 +60,8 @@ roll/pitch leveling — the vertical component and separation are yaw-invariant)
 
 ## Consequences
 
-- Course knowledge is a persisted artifact (CSV + constants in fly2.py). **Before a
+- Course knowledge is a persisted artifact (CSV + the mission's config TOMLs).
+  **Before a
   Competitive submission, verify the rules allow persisted per-course constants**
   (runs are code-auditable); Training-phase use is unambiguous.
 - The map is expressed in gate-relative terms (range bands, turn direction, relative

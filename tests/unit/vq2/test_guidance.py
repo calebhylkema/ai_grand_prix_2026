@@ -10,9 +10,11 @@ Conventions: world NED, body FRD (thrust along body -z), gravity +Z down.
 from __future__ import annotations
 
 import numpy as np
-from eskf import quat_from_rotvec
-from estimator import quat_mul, quat_to_matrix
-from guidance import G, geometric_control
+import pytest
+
+from drone_racing.deployments.vq2.attitude import quat_mul, quat_to_matrix
+from drone_racing.deployments.vq2.eskf import quat_from_rotvec
+from drone_racing.deployments.vq2.guidance import G, geometric_control
 
 
 def simulate(p0: np.ndarray, v0: np.ndarray, secs: float = 8.0, hover: float = 0.30) -> dict:
@@ -45,25 +47,19 @@ def simulate(p0: np.ndarray, v0: np.ndarray, secs: float = 8.0, hover: float = 0
     }
 
 
-def main() -> None:
-    starts = [
-        (np.array([-8.0, 0.0, 0.0]), "straight, 8m back"),
-        (np.array([-6.0, 3.0, -1.0]), "turn: 6m back, 3m right, 1m up"),
-        (np.array([-5.0, -2.5, 2.0]), "turn: 5m back, 2.5m left, 2m down"),
-        (np.array([-10.0, 4.0, 1.5]), "far turn: 10m back, 4m right"),
-    ]
-    print("--- Geometric guidance offline validation ---")
-    all_ok = True
-    for p0, desc in starts:
-        r = simulate(p0, np.zeros(3))
-        ok = (not r["diverged"]) and r["pos_err"] < 0.5 and r["speed"] < 1.5 and r["max_tilt"] < 45
-        all_ok = all_ok and ok
-        print(
-            f"  {desc:38s} pos_err={r['pos_err']:.2f}m speed={r['speed']:.2f}m/s "
-            f"max_tilt={r['max_tilt']:.0f}deg  {'OK' if ok else 'FAIL'}"
-        )
-    print("  RESULT:", "PASS" if all_ok else "FAIL")
-
-
-if __name__ == "__main__":
-    main()
+@pytest.mark.parametrize(
+    ("p0", "desc"),
+    [
+        ((-8.0, 0.0, 0.0), "straight, 8m back"),
+        ((-6.0, 3.0, -1.0), "turn: 6m back, 3m right, 1m up"),
+        ((-5.0, -2.5, 2.0), "turn: 5m back, 2.5m left, 2m down"),
+        ((-10.0, 4.0, 1.5), "far turn: 10m back, 4m right"),
+    ],
+)
+def test_geometric_control_converges(p0: tuple[float, float, float], desc: str) -> None:
+    """From each start offset: converge to the gate, arrive slow, never over-tilt."""
+    r = simulate(np.array(p0), np.zeros(3))
+    assert not r["diverged"], desc
+    assert r["pos_err"] < 0.5, f"{desc}: pos_err={r['pos_err']:.2f}m"
+    assert r["speed"] < 1.5, f"{desc}: speed={r['speed']:.2f}m/s"
+    assert r["max_tilt"] < 45, f"{desc}: max_tilt={r['max_tilt']:.0f}deg"

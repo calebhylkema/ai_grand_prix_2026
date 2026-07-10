@@ -19,7 +19,8 @@ scalar-first [w,x,y,z] body->world.
 from __future__ import annotations
 
 import numpy as np
-from estimator import G, quat_mul, quat_to_euler, quat_to_matrix
+
+from drone_racing.deployments.vq2.attitude import G, quat_mul, quat_to_euler, quat_to_matrix
 
 
 def skew(v: np.ndarray) -> np.ndarray:

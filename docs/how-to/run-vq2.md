@@ -11,13 +11,14 @@
 ## Fly the mission
 
 ```bash
-uv run aigp-vq2 --attempts 3 --secs 60
+uv run aigp-vq2 --config training --attempts 3 --secs 60
 ```
 
 This runs the map-and-plan phased executor (`drone_racing.deployments.vq2.mission`):
 STAB → thread gate 0 → brake/climb on the gate-pass event → scan to the mapped
-bearing → map-gated accept → thread. Use `--help` for all options, including stage
-isolation flags for testing individual layers (hover / forward / race).
+bearing → map-gated accept → thread. `--config` names a deployment config
+(`training` / `qualification`) or an explicit TOML path; `--secs` / `--attempts`
+override the config's run parameters. Use `--help` for all options.
 
 Key behaviors to know:
 

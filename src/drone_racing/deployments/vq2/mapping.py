@@ -21,27 +21,29 @@ gate 0 on nearly the same heading). Single-gate sightings are also dumped (with 
 active_gate context from the trace filename) for identity/cluster analysis.
 
 Usage:
-    uv run python scripts/vq2/course_map.py [trace_dir ...]
-        (default: every prev_* under data/vq2/fly_trace)
+    uv run python -m drone_racing.deployments.vq2.mapping [trace_dir ...]
+        (default: every prev_* under .local/datasets/vq2/fly_trace)
 
-Writes data/vq2/map/observations.csv and prints the co-visible pair table.
+Writes .local/datasets/vq2/map/observations.csv and prints the co-visible pair table.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import math
 import re
-import sys
 from pathlib import Path
 
 import cv2
-import gates
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
-TRACE_ROOT = ROOT / "data" / "vq2" / "fly_trace"
-OUT_DIR = ROOT / "data" / "vq2" / "map"
+from drone_racing.deployments.vq2 import perception as gates
+from drone_racing.utils.workspace import Workspace
+
+_WS = Workspace.locate()
+TRACE_ROOT = _WS.datasets / "vq2" / "fly_trace"
+OUT_DIR = _WS.datasets / "vq2" / "map"
 
 # trace filename telemetry: NNN_tX.XX_r{roll}p{pitch}_vz{vz}_gz{gz}_g{active_gate}_...
 _NAME_RE = re.compile(
@@ -128,10 +130,16 @@ def pair_table(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     return pairs
 
 
-def main() -> None:
-    dirs = (
-        [Path(a) for a in sys.argv[1:]] if len(sys.argv) > 1 else sorted(TRACE_ROOT.glob("prev_*"))
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="Mine gate geometry from saved fly_trace frames.")
+    ap.add_argument(
+        "trace_dirs",
+        nargs="*",
+        type=Path,
+        help=f"trace archive dirs (default: every prev_* under {TRACE_ROOT})",
     )
+    args = ap.parse_args(argv)
+    dirs = args.trace_dirs if args.trace_dirs else sorted(TRACE_ROOT.glob("prev_*"))
     rows = scan(dirs)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     if rows:

@@ -34,17 +34,23 @@ import math
 import sys
 import threading
 import time
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-import control_check as cc
 import cv2
-import gates
 import numpy as np
-from eskf import ESKF
-from estimator import AttitudeEstimator, VelocityEstimator
 from pymavlink import mavutil
 
-COLL_DUMP_DIR = Path(__file__).resolve().parents[2] / "data" / "vq2" / "fly_collisions"
+from drone_racing.deployments.vq2 import calibration as cc
+from drone_racing.deployments.vq2 import perception as gates
+from drone_racing.deployments.vq2.attitude import AttitudeEstimator, VelocityEstimator
+from drone_racing.deployments.vq2.eskf import ESKF
+from drone_racing.utils.workspace import Workspace
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+_WS = Workspace.locate()
+COLL_DUMP_DIR = _WS.datasets / "vq2" / "fly_collisions"
 
 # Calibration is ALWAYS on for this controller: cc.send_att maps desired->raw rates.
 cc.CALIBRATE = True
@@ -64,7 +70,7 @@ VZ_CLAMP = 3.0  # clamp the logged value so an impact spike doesn't dominate the
 # Dump a camera frame every TRACE_DT with attitude / vz / gate-detect baked into the
 # filename, so the frame SEQUENCE into a collision can be read back to reconstruct the
 # approach geometry. Cleared at the start of each race run.
-TRACE_DIR = Path(__file__).resolve().parents[2] / "data" / "vq2" / "fly_trace"
+TRACE_DIR = _WS.datasets / "vq2" / "fly_trace"
 TRACE_DT = 0.15  # seconds between trace frames
 
 # --- outer attitude P loop (desired body rate from attitude error) ---

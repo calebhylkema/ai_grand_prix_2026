@@ -1,4 +1,4 @@
-"""Glow-resistant gate perception for VQ2 (validated offline in detect_lab.py).
+"""Glow-resistant gate perception for VQ2 (validated offline; see ``diagnostics.py lab``).
 
 The gate-1 ENV collisions (2026-07-01/02) were traced to a perception trap: the
 gates cast a huge diffuse red GLOW on nearby walls/pillars/floor. Both the blob
@@ -244,7 +244,9 @@ def detect_line(img: np.ndarray) -> LineTarget | None:
 
 def red_mask(img: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, RED_LO1, RED_HI1) | cv2.inRange(hsv, RED_LO2, RED_HI2)
+    mask = cv2.inRange(hsv, RED_LO1, RED_HI1) | cv2.inRange(  # type: ignore[operator]
+        hsv, RED_LO2, RED_HI2
+    )
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
 

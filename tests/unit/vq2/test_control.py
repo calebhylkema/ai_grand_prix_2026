@@ -1,6 +1,6 @@
-"""Unit tests for the VQ2 controller's pure control math (fly.py).
+"""Unit tests for the VQ2 runtime's pure control math.
 
-Run: uv run pytest scripts/vq2/test_control.py -q
+Run: uv run pytest tests/unit/vq2/test_control.py -q
 
 Locks in the 2026-07-02 control logic that got the drone airborne past the floor
 sink: the camera-row vertical PD servo (``vertical_thrust``) and the tilt-
@@ -13,12 +13,13 @@ from __future__ import annotations
 import math
 import threading
 
-import control_check as cc
 import cv2
-import fly
-import gates
 import numpy as np
-from gates import GateTarget, LineTarget
+
+from drone_racing.deployments.vq2 import calibration as cc
+from drone_racing.deployments.vq2 import perception as gates
+from drone_racing.deployments.vq2 import runtime as fly
+from drone_racing.deployments.vq2.perception import GateTarget, LineTarget
 
 
 def _gate(cy: float, area: float, bearing: float = 0.0) -> GateTarget:

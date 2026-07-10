@@ -1,6 +1,6 @@
 """Unit tests locking in the VQ2 estimation math (attitude filter + ESKF).
 
-Run: uv run pytest scripts/vq2/test_estimation.py -q
+Run: uv run pytest tests/unit/vq2/test_estimation.py -q
 
 These encode the ground-truth-free / synthetic validations we relied on:
 - attitude estimator reads the known rest pose with zero gravity error,
@@ -13,8 +13,9 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from eskf import ESKF, quat_from_rotvec
-from estimator import AttitudeEstimator, G, quat_mul, quat_to_matrix
+
+from drone_racing.deployments.vq2.attitude import AttitudeEstimator, G, quat_mul, quat_to_matrix
+from drone_racing.deployments.vq2.eskf import ESKF, quat_from_rotvec
 
 
 def test_quat_from_rotvec_small_angle() -> None:

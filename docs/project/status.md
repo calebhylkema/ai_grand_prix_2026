@@ -11,9 +11,12 @@ full-course time in Qualification mode → qualify for the September physical ro
 
 **Active runner:** `aigp-vq2` (`drone_racing.deployments.vq2.mission` — the
 map-and-plan phased executor, per [ADR-0003](../decisions/0003-course-map-and-plan.md)).
-The superseded reactive controller lives in `archive/vq2_experiments/reactive_fly/`;
-its proven primitives (Flight runtime, calibrated command boundary, thrust helpers)
-were extracted into `drone_racing.deployments.vq2.runtime`.
+The superseded reactive controller's proven primitives (Flight runtime, calibrated
+command boundary, thrust helpers) were extracted into
+`drone_racing.deployments.vq2.runtime`. The reactive controller itself stays
+runnable at `scripts/vq2/fly.py` until a live gate-0 regression (baseline: 100%
+thread @ ~2.2 s) revalidates the extraction; then it moves to
+`archive/vq2_experiments/reactive_fly/`.
 
 ## What works (validated)
 
