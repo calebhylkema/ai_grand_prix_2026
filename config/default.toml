@@ -38,9 +38,12 @@ width = 640
 height = 360
 distortion = [0.0, 0.0, 0.0, 0.0, 0.0]  # k1, k2, p1, p2, k3
 
-# Camera-to-body extrinsic. VQ2 spec: camera tilted 20° UPWARD from the body axis.
-# transforms.camera_to_body_rotation() treats positive tilt as FORWARD/down, so up = -20.
-# (scripts/vq2/race.py hardcodes the same geometry independently and is already correct.)
+# Camera-to-body extrinsic. ⚠️ 2026-07-03: the sim camera actually points ~20° DOWN
+# (verified from live imagery on build 3379: a level hover puts the horizon at y≈64
+# with the floor filling the frame; far gates are detected right at that line). The
+# spec-derived "20° upward" reading was WRONG. scripts/vq2/gates.py CAM_TO_BODY
+# empirically produces correct body poses (on-axis point maps to body z>0 = below);
+# if you wire THIS value into new code, verify the transform against a known frame.
 tilt_deg = -20.0
 
 [estimation]

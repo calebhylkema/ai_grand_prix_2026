@@ -39,6 +39,68 @@ def test_attitude_estimator_rest_pose() -> None:
     assert est.mean_grav_err_deg < 0.5
 
 
+def test_in_flight_accel_is_ignored() -> None:
+    """Run-E (2026-07-04): in steady cruise the gyro is quiet and |a|=g·sec(18°)≈1.05g
+    — inside every gate we had — so the accel correction slowly erased real nose-down
+    pitch (+12° bias → vz read 'climb' while the drone skimmed the floor into an
+    obstacle). In flight the accel must be ignored entirely: gyro-only + vision roll."""
+    est = AttitudeEstimator()
+    est.initialise(np.array([0.0, 0.0, -G]))
+    est.in_flight = True
+    # pitch nose-down 15° via gyro, then cruise steadily for 6 s while the accel
+    # reads pure body-z thrust at 1.05g ("level" — the cruise lie).
+    for _ in range(50):
+        est.update(np.array([0.0, math.radians(-15.0 / 0.5), 0.0]), np.zeros(3), 0.01)
+    lying_accel = np.array([0.0, 0.0, -1.05 * G])
+    for _ in range(600):
+        est.update(np.zeros(3), lying_accel, 0.01)
+    _, pitch, _ = est.euler
+    assert abs(math.degrees(pitch) - (-15.0)) < 0.5, "cruise accel corrupted the pitch"
+
+
+def test_correct_roll_fixes_hidden_bank() -> None:
+    """THE run-3 crash (2026-07-03): the accel correction erases real bank (a quad's
+    accel reads body-z thrust = 'level' at any bank). correct_roll must be able to
+    drag the estimate to the vision-measured bank and hold it against that pull."""
+    est = AttitudeEstimator()
+    est.initialise(np.array([0.0, 0.0, -G]))
+    # filter believes level; vision (world-upright gate) says banked 40 deg left.
+    # ~1.5 s of sightings at 50 Hz: the slew limit walks the estimate in smoothly.
+    for _ in range(75):
+        est.correct_roll(math.radians(-40.0), gain=0.5)
+        # accel keeps insisting "level" between sightings (thrust along body -z)
+        est.update(np.zeros(3), np.array([0.0, 0.0, -G]), 0.02)
+    roll, _, _ = est.euler
+    assert abs(math.degrees(roll) - (-40.0)) < 5.0
+
+
+def test_correct_roll_slew_limited() -> None:
+    """Run-4 lesson: a single call must NOT slam a big error into the estimate —
+    step-driving the attitude P-loop against vision latency limit-cycled at ±38°."""
+    est = AttitudeEstimator()
+    est.initialise(np.array([0.0, 0.0, -G]))
+    est.correct_roll(math.radians(-40.0), gain=0.5, max_step=0.02)
+    roll, _, _ = est.euler
+    assert abs(roll - (-0.02)) < 1e-6  # exactly one slew step toward the measurement
+
+
+def test_correct_roll_wraps_angle() -> None:
+    """A near-pi disagreement corrects the short way round (no 2*pi spin-up)."""
+    est = AttitudeEstimator()
+    est.initialise(np.array([0.0, 0.0, -G]))
+    est.correct_roll(math.radians(170.0), gain=1.0)
+    roll, _, _ = est.euler
+    assert 0.0 < roll < math.radians(171.0)  # moved toward +170 the short way
+
+
+def test_correct_roll_zero_error_is_noop() -> None:
+    est = AttitudeEstimator()
+    est.initialise(np.array([0.0, 0.0, -G]))
+    q0 = est.q.copy()
+    est.correct_roll(0.0, gain=0.5)
+    assert np.allclose(est.q, q0, atol=1e-9)
+
+
 def _run_synthetic(seed: int = 0) -> tuple[float, float, float]:
     rng = np.random.default_rng(seed)
     dt = 0.01

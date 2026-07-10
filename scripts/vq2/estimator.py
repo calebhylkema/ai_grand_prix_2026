@@ -18,6 +18,8 @@ Conventions: body FRD, world NED (gravity = +Z down). Quaternion is scalar-first
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 G = 9.81
@@ -70,6 +72,8 @@ class AttitudeEstimator:
         self.q = np.array([1.0, 0.0, 0.0, 0.0])
         self.kp = kp
         self._initialised = False
+        self._vis_mute = 0  # updates left with accel muted (vision roll is streaming)
+        self.in_flight = False  # set True at takeoff: accel correction OFF (see update)
         # rolling validation stats
         self._grav_err_sum = 0.0
         self._grav_err_n = 0
@@ -92,13 +96,25 @@ class AttitudeEstimator:
             return
         amag = float(np.linalg.norm(accel))
         omega = np.array(gyro, dtype=float)
-        # Accel correction only when |accel| is near g (weight tapers to 0 away from g).
-        if amag > 1e-3:
+        # Accel correction ONLY on the ground (in_flight=False). Every gate we tried
+        # (|a|≈g band, gyro-quiet, vis-mute) still let it lie in some flight regime,
+        # because on a quad the accel measures body-z thrust — direction "level" — at
+        # ANY attitude: it erased a real 41° bank (run-3 crash, 2026-07-03) and in
+        # steady cruise (gyro quiet, |a|=g·sec(18°)≈1.05g, inside every band) it built
+        # a +12° nose-up pitch bias (run-E, 2026-07-04: filter p+8 while the horizon
+        # row in the trace frames showed real p≈−4 → vz integration read "climb" while
+        # the drone skimmed the floor into an obstacle). In flight: gyro integration
+        # (drift-free over a run) + the vision-absolute roll from gate PnP.
+        if amag > 1e-3 and not self.in_flight:
             a_hat = np.asarray(accel, float) / amag
             r = quat_to_matrix(self.q)
             up_body = r.T @ np.array([0.0, 0.0, -1.0])  # predicted gravity-up in body
             err = np.cross(a_hat, up_body)  # rotation that aligns prediction to measurement
             w_acc = max(0.0, 1.0 - abs(amag - G) / 2.5)  # 1 at |a|=g, 0 by 2.5 m/s^2 off
+            w_acc *= max(0.0, 1.0 - float(np.linalg.norm(omega)) / 0.6)  # 0 by 0.6 rad/s
+            if self._vis_mute > 0:  # an ABSOLUTE roll reference is streaming: don't
+                self._vis_mute -= 1  # let the bank-blind accel fight it to a biased
+                w_acc *= 0.2  # equilibrium (test: 40° vision vs accel stalled at 34.6°)
             omega = omega + self.kp * w_acc * err
             # validation: instantaneous gravity-alignment error (deg), steady windows only
             if w_acc > 0.5:
@@ -109,6 +125,28 @@ class AttitudeEstimator:
         qdot = 0.5 * quat_mul(self.q, np.array([0.0, *omega]))
         self.q = self.q + qdot * dt
         self.q /= np.linalg.norm(self.q)
+
+    def correct_roll(self, roll_meas: float, gain: float = 0.5, max_step: float = 0.02) -> None:
+        """Absolute roll correction from vision (world-upright gate PnP), slew-limited.
+
+        2026-07-03: the accel correction is structurally blind to bank in flight — a
+        quad's accelerometer reads body-z thrust ("level" at ANY bank), so it actively
+        erases real bank from the gyro integral (run-3 crash: real 41° bank, estimate
+        +5°). A visible gate's in-plane rotation is a drift-free roll reference.
+
+        ``max_step`` caps the per-call rotation: run-4 showed that slamming a large
+        error into the estimate at once (gain 0.5, ~50 Hz) step-drives the attitude
+        P-loop against ~1-frame vision latency → ±38° limit cycle. 0.02 rad/call at
+        ≤50 Hz is a ≤57°/s slew the P-loop tracks smoothly; a hidden 40° bank is fully
+        walked in within ~0.7 s of continuous sightings.
+        """
+        roll, _, _ = self.euler
+        err = math.atan2(math.sin(roll_meas - roll), math.cos(roll_meas - roll))
+        a = float(np.clip(gain * err, -max_step, max_step))  # slew-limited body-x rotation
+        dq = np.array([math.cos(a / 2), math.sin(a / 2), 0.0, 0.0])
+        self.q = quat_mul(self.q, dq)  # body-frame rotation: right-multiply
+        self.q /= np.linalg.norm(self.q)
+        self._vis_mute = 25  # ~0.25-0.5 s of IMU updates: mute the accel pull-to-level
 
     @property
     def euler(self) -> tuple[float, float, float]:
