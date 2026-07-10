@@ -2,8 +2,8 @@
 
 Usage::
 
-    cfg = load_config()                          # loads config/default.toml
-    cfg = load_config("config/race_day.toml")    # loads a custom file
+    cfg = load_config()                          # loads the packaged default.toml
+    cfg = load_config("my_race_day.toml")        # loads a custom file
 
 All config sections are returned as typed dataclasses defined in
 :mod:`drone_racing.utils.types`.
@@ -24,7 +24,7 @@ from drone_racing.utils.types import (
     PlannerConfig,
 )
 
-_DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "default.toml"
+_DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "default.toml"
 
 
 @dataclass(slots=True)
@@ -47,7 +47,7 @@ def load_config(path: str | Path | None = None) -> RacingConfig:
     Parameters
     ----------
     path : str | Path | None
-        Path to the TOML file.  Defaults to ``config/default.toml``.
+        Path to the TOML file.  Defaults to the packaged ``default.toml``.
 
     Returns
     -------

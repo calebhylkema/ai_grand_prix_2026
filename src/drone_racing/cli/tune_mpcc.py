@@ -7,8 +7,8 @@ settings and reports solve time + success rate.
 
 Usage::
 
-    uv run python scripts/tune_mpcc.py
-    uv run python scripts/tune_mpcc.py --iterations 50
+    uv run aigp-benchmark mpcc
+    uv run aigp-benchmark mpcc --iterations 50
 
 Each variant is run for ``iterations`` warm solves against a shifting state
 trajectory (to simulate real operation with warm-starting).
@@ -19,17 +19,14 @@ from __future__ import annotations
 import argparse
 import logging
 import statistics
-import sys
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
-from drone_racing.planning.spline import build_racing_line
+from drone_racing.planning.spline import RacingLine, build_racing_line
 from drone_racing.utils.config import load_config
 from drone_racing.utils.types import GateWaypoint, PlannerConfig
 
@@ -41,10 +38,10 @@ class Variant:
     name: str
     horizon: int
     dt: float
-    solver_opts: dict
+    solver_opts: dict[str, Any]
 
 
-def _build_circuit_and_line():
+def _build_circuit_and_line() -> RacingLine:
     config = load_config()
     corners_local = config.gate.outer_corners_3d_array
     gate_defs = [
@@ -94,7 +91,7 @@ def _make_variants() -> list[Variant]:
         "print_time": 0,
     }
 
-    def with_opts(**overrides) -> dict:
+    def with_opts(**overrides: Any) -> dict[str, Any]:
         d = dict(base_opts)
         d.update(overrides)
         return d
@@ -163,7 +160,7 @@ def _make_state(x: float = 5.0, v: float = 5.0) -> np.ndarray:
     return np.array([x, 0.0, 3.0, v, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
 
-def run_variant(racing_line, variant: Variant, n_iter: int) -> dict:
+def run_variant(racing_line: RacingLine, variant: Variant, n_iter: int) -> dict[str, Any]:
     """Run one variant and collect timing + success stats."""
     cfg = MPCCConfig(horizon=variant.horizon, dt=variant.dt, solver_opts=variant.solver_opts)
     solver = MPCCSolver(racing_line, config=cfg, closed=True)
@@ -197,13 +194,13 @@ def run_variant(racing_line, variant: Variant, n_iter: int) -> dict:
     }
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="MPCC solver parameter sweep",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--iterations", type=int, default=30, help="Solves per variant")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 

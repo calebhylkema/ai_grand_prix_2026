@@ -17,8 +17,9 @@ The VQ2 deployment intentionally **hardcodes the official camera intrinsics**
 
 ## Package config
 
-`config/default.toml` configures the pre-sim-lineage package pipeline
-(perception/planning/control modules). It is not read by the VQ2 mission.
+`src/drone_racing/config/default.toml` (packaged with the wheel; loaded by
+`drone_racing.utils.config.load_config`) configures the pre-sim-lineage package
+pipeline (perception/planning/control modules). It is not read by the VQ2 mission.
 
 ## Workspace paths
 

@@ -9,8 +9,8 @@ Target: <40ms total pipeline latency (see CLAUDE.md).
 
 Usage::
 
-    uv run python scripts/bench_pipeline.py
-    uv run python scripts/bench_pipeline.py --iterations 500 --warmup 50
+    uv run aigp-benchmark pipeline
+    uv run aigp-benchmark pipeline --iterations 500 --warmup 50
 
 The benchmark uses the MockSimAdapter to generate realistic synthetic frames
 with visible gates, then runs each pipeline stage and reports timing statistics.
@@ -21,15 +21,10 @@ from __future__ import annotations
 import argparse
 import logging
 import statistics
-import sys
 import time
-from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
-
-# Ensure project root is on path
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from drone_racing.control.mpcc_adapter import MPCCController
 from drone_racing.control.pid import PIDController
@@ -328,7 +323,7 @@ def run_benchmark(n_iterations: int, n_warmup: int) -> None:
         print(f"\nWARN: p95 total = {p95_total:.2f} ms >= {_LATENCY_TARGET_MS} ms target")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
         description="Benchmark perception-to-control pipeline latency",
@@ -336,7 +331,7 @@ def main() -> None:
     )
     parser.add_argument("--iterations", type=int, default=200, help="Timed iterations")
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     run_benchmark(args.iterations, args.warmup)

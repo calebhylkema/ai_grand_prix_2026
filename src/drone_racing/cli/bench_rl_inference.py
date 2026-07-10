@@ -7,33 +7,30 @@ for deciding whether RL is viable as the primary controller.
 
 Usage::
 
-    uv run python scripts/bench_rl_inference.py --model runs/rl_smoke/final_model
+    uv run aigp-benchmark rl --model .local/runs/rl_smoke/final_model
 """
 
 from __future__ import annotations
 
 import argparse
 import statistics
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="RL policy inference benchmark")
     parser.add_argument(
         "--model",
         type=str,
-        default="runs/rl_smoke/final_model",
+        default=".local/runs/rl_smoke/final_model",
         help="Path to PPO model (without .zip extension)",
     )
     parser.add_argument("--iterations", type=int, default=1000, help="Timed iterations")
     parser.add_argument("--warmup", type=int, default=50, help="Warmup iterations")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     from stable_baselines3 import PPO
 
@@ -81,7 +78,7 @@ def main() -> None:
     print("=" * 90)
 
     # Compare to MPCC
-    print("\nContext: MPCC p95 is ~13-22ms (from scripts/tune_mpcc.py)")
+    print("\nContext: MPCC p95 is ~13-22ms (from `aigp-benchmark mpcc`)")
     p95_det = sorted(det_times)[int(len(det_times) * 0.95)]
     speedup = 22.3 / p95_det if p95_det > 0 else float("inf")
     print(f"RL speedup vs MPCC baseline: ~{speedup:.0f}x")

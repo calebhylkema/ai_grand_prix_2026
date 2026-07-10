@@ -21,22 +21,19 @@ All coordinates normalised to [0, 1].  kp_v: 0=missing, 2=visible.
 
 Usage::
 
-    uv run python scripts/generate_training_data.py --num-train 2000 --num-val 200
-    uv run python scripts/generate_training_data.py --output data/gates --num-train 5000
+    uv run aigp-train-detector generate --num-train 2000 --num-val 200
+    uv run aigp-train-detector generate --output .local/datasets/gates --num-train 5000
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from drone_racing.utils.config import load_config
 from drone_racing.utils.transforms import body_to_camera_rotation
@@ -207,9 +204,9 @@ def apply_domain_randomisation(
         h, w = img.shape[:2]
         n_rects = rng.integers(1, 6)
         for _ in range(n_rects):
-            x1, y1 = rng.integers(0, w), rng.integers(0, h)
-            x2 = min(x1 + rng.integers(20, 150), w)
-            y2 = min(y1 + rng.integers(20, 150), h)
+            x1, y1 = int(rng.integers(0, w)), int(rng.integers(0, h))
+            x2 = int(min(x1 + rng.integers(20, 150), w))
+            y2 = int(min(y1 + rng.integers(20, 150), h))
             colour = tuple(int(c) for c in rng.integers(50, 200, 3))
             cv2.rectangle(img, (x1, y1), (x2, y2), colour, -1)
 
@@ -527,7 +524,7 @@ def _generate_gate_poses(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     logging.basicConfig(
         level=logging.INFO,
@@ -541,13 +538,13 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=str,
-        default="data/gate_keypoints",
-        help="Output directory (default: data/gate_keypoints)",
+        default=".local/datasets/gate_keypoints",
+        help="Output directory (default: .local/datasets/gate_keypoints)",
     )
     parser.add_argument("--num-train", type=int, default=2000, help="Training samples")
     parser.add_argument("--num-val", type=int, default=200, help="Validation samples")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     generate_dataset(
         output_dir=Path(args.output),

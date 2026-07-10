@@ -48,16 +48,24 @@ all = [
     "ai-grand-prix[perception,control,rl,viz,dev]",
 ]
 
+[project.scripts]
+aigp-vq2 = "drone_racing.deployments.vq2.mission:main"
+aigp-calibrate = "drone_racing.deployments.vq2.calibration:main"
+aigp-replay = "drone_racing.cli.replay:main"
+aigp-train-detector = "drone_racing.cli.train_detector:main"
+aigp-benchmark = "drone_racing.cli.benchmark:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["drone_racing"]
+packages = ["src/drone_racing"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["archive"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
@@ -72,10 +80,20 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+exclude = ["archive/"]
 
 [[tool.mypy.overrides]]
 module = ["cv2.*", "casadi.*", "onnxruntime.*", "ultralytics.*", "scipy.*"]
 ignore_missing_imports = true
+
+# The VQ2 deployment migrated from flight-validated scripts (2026-07-09 reorg).
+# Relaxed while it converges to package-wide strictness — do not let this spread.
+[[tool.mypy.overrides]]
+module = ["drone_racing.deployments.vq2.*"]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -84,11 +102,12 @@ markers = [
     "slow: marks tests that take >10s",
     "benchmark: marks latency benchmarks",
 ]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers --import-mode=importlib"
+norecursedirs = [".*", "build", "dist", "*.egg", "archive"]
 
 [tool.coverage.run]
 source = ["drone_racing"]
-omit = ["drone_racing/logging/*"]
+omit = ["*/drone_racing/logging/*"]
 
 [tool.coverage.report]
 fail_under = 80

@@ -9,9 +9,9 @@ Architecture: MLP policy (G&CNet-style, 3 hidden layers × 64 neurons).
 
 Usage::
 
-    uv run python scripts/train_policy.py
-    uv run python scripts/train_policy.py --timesteps 500000 --lr 3e-4
-    uv run python scripts/train_policy.py --resume runs/rl/best_model.zip
+    uv run python -m drone_racing.training.rl_policy
+    uv run python -m drone_racing.training.rl_policy --timesteps 500000 --lr 3e-4
+    uv run python -m drone_racing.training.rl_policy --resume .local/runs/rl/best_model.zip
 
 Requires the ``rl`` optional dependencies::
 
@@ -22,14 +22,10 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
-
-# Ensure project root is on path
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from drone_racing.control.rl_env import (
     DomainRandomizationConfig,
@@ -130,7 +126,12 @@ def train(args: argparse.Namespace) -> None:
             CheckpointCallback,
             EvalCallback,
         )
-        from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+        from stable_baselines3.common.vec_env import (
+            DummyVecEnv,
+            SubprocVecEnv,
+            VecEnv,
+            VecNormalize,
+        )
     except ImportError as e:
         msg = (
             "RL dependencies not installed. Run: uv pip install -e '.[rl]'\n"
@@ -166,6 +167,7 @@ def train(args: argparse.Namespace) -> None:
     def make_train_env() -> DroneRacingEnv:
         return make_env(gates, racing_line, env_config)
 
+    raw_train_env: VecEnv
     if args.n_envs > 1:
         raw_train_env = SubprocVecEnv([make_train_env for _ in range(args.n_envs)])
     else:
@@ -299,7 +301,7 @@ def train(args: argparse.Namespace) -> None:
     eval_env.close()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
         description="Train an RL racing policy with PPO",
@@ -323,14 +325,14 @@ def main() -> None:
     )
     parser.add_argument("--max-episode-steps", type=int, default=2000, help="Max steps per episode")
     parser.add_argument("--resume", type=str, default=None, help="Path to model to resume")
-    parser.add_argument("--output-dir", type=str, default="runs/rl", help="Output directory")
+    parser.add_argument("--output-dir", type=str, default=".local/runs/rl", help="Output directory")
     parser.add_argument(
         "--randomize",
         action="store_true",
         help="Enable per-episode domain randomization (start jitter + drag/IMU scaling)",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     train(args)

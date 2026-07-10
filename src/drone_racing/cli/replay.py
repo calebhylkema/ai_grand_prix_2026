@@ -10,9 +10,8 @@ Loads a .npz flight log and produces:
 
 Usage::
 
-    uv run python scripts/visualize_flight.py                      # latest log
-    uv run python scripts/visualize_flight.py logs/flight_xxx.npz  # specific log
-    uv run python scripts/visualize_flight.py --run                 # run sim then visualize
+    uv run aigp-replay                                # latest log in .local/logs/
+    uv run aigp-replay .local/logs/flight_xxx.npz     # specific log
 """
 
 from __future__ import annotations
@@ -20,13 +19,14 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import LineCollection
 
-# Ensure project root is on path
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 
 def load_flight_log(path: Path) -> dict[str, np.ndarray]:
@@ -54,11 +54,11 @@ def find_latest_log() -> Path:
     Path
         Path to the latest .npz log file.
     """
-    log_dir = Path("logs")
+    log_dir = Path(".local/logs")
     logs = sorted(log_dir.glob("flight_*.npz"), key=lambda p: p.stat().st_mtime)
     if not logs:
-        print("No flight logs found in logs/. Run the sim first:")
-        print("  uv run python scripts/run_sim.py")
+        print("No flight logs found in .local/logs/. Fly a mission first:")
+        print("  uv run aigp-vq2")
         sys.exit(1)
     return logs[-1]
 
@@ -161,7 +161,7 @@ def get_gate_positions() -> np.ndarray:
 
 
 def speed_coloured_line(
-    ax: plt.Axes,
+    ax: Axes,
     x: np.ndarray,
     y: np.ndarray,
     speed: np.ndarray,
@@ -190,7 +190,7 @@ def speed_coloured_line(
     """
     points = np.column_stack([x, y]).reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
-    lc = LineCollection(segments, cmap=cmap, linewidth=linewidth)
+    lc = LineCollection(list(segments), cmap=cmap, linewidth=linewidth)
     lc.set_array(speed[:-1])
     ax.add_collection(lc)
     return lc
@@ -380,7 +380,7 @@ def visualize(log_path: Path) -> None:
 
     ax_spd = ax_alt.twinx()
     ax_spd.plot(est["t"], est_speed, "r-", linewidth=1, alpha=0.7, label="Speed (m/s)")
-    if gt_speed is not None:
+    if gt is not None and gt_speed is not None:
         ax_spd.plot(gt["t"], gt_speed, "r--", alpha=0.3, linewidth=1)
     ax_spd.set_ylabel("Speed (m/s)", color="red")
     ax_spd.tick_params(axis="y", labelcolor="red")
@@ -432,39 +432,19 @@ def visualize(log_path: Path) -> None:
     )
     fig.text(0.5, 0.02, stats_text, ha="center", fontsize=10, style="italic")
 
-    plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+    plt.tight_layout(rect=(0, 0.04, 1, 0.96))
     plt.show()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(description="Visualize flight log")
     parser.add_argument(
         "log_path", nargs="?", default=None, help="Path to .npz flight log (default: latest)"
     )
-    parser.add_argument("--run", action="store_true", help="Run simulation first, then visualize")
-    parser.add_argument(
-        "--max-time", type=float, default=60.0, help="Max sim time if --run (seconds)"
-    )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    if args.run:
-        from scripts.run_sim import run_pipeline
-
-        from drone_racing.utils.config import load_config
-
-        config = load_config()
-        import logging
-
-        logging.basicConfig(
-            level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
-        )
-        run_pipeline(config, max_time=args.max_time, log_path="logs/viz_latest.npz")
-        log_path = Path("logs/viz_latest.npz")
-    elif args.log_path:
-        log_path = Path(args.log_path)
-    else:
-        log_path = find_latest_log()
+    log_path = Path(args.log_path) if args.log_path else find_latest_log()
 
     if not log_path.exists():
         print(f"File not found: {log_path}")
