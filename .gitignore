@@ -24,21 +24,22 @@ venv/
 htmlcov/
 .pytest_cache/
 .hypothesis/
+.benchmarks/
+.mypy_cache/
+.ruff_cache/
 
-# Logs and data
-logs/
+# Local workspace: simulators, datasets, models, recordings, runs, logs, doc builds.
+# Everything generated or machine-local lives here — never in the repo root.
+.local/
+
+# Model weights (too large for git — use DVC or git-lfs)
+*.pt
+*.pth
+*.onnx
+
+# Logs anywhere
 *.log
 *.bag
-flight_data/
-data/
-runs/
-
-# Models (too large for git — use DVC or git-lfs)
-models/*.onnx
-models/*.pt
-models/*.pth
-*.pt
-*.onnx
 
 # Docker
 .docker/
@@ -47,14 +48,11 @@ models/*.pth
 .DS_Store
 Thumbs.db
 
-# Claude Code local settings
+# Claude Code local state
 CLAUDE.local.md
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Competition credentials
 .env
 *.key
-
-# Simulator installs (large / local). SIMULATOR/ = VQ1 sim v1.0.3364 (ground-truth
-# validation rig — keep). VQ2/ = VQ2 sim v1.0.3379.
-/SIMULATOR/
-/VQ2/

@@ -6,7 +6,16 @@ allowed-tools:
   - Write
 ---
 
-Run the project test suite using `uv run pytest tests/ -v --tb=short`. If any tests fail:
+Run the project test suite using `uv run pytest -v --tb=short`. This collects:
+
+- `tests/unit/` — subsystem unit tests (including VQ2 deployment tests)
+- `tests/integration/` — multi-component pipeline tests
+- `tests/replay/vq2/` — saved-frame / recorded-transition tests
+
+Live-simulator tests in `tests/simulation/` are marked `simulation` and excluded by
+default; `archive/` is never collected.
+
+If any tests fail:
 
 1. Read the failing test to understand what it expects
 2. Read the source code being tested

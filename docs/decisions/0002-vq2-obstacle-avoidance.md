@@ -58,5 +58,8 @@ layered approach matched to our monocular, non-learned stack:
 - For the physical qualifier, the reactive net + precise line is the qualifying-grade plan;
   learned/RL avoidance is the finals stretch goal, not a prerequisite.
 
-Files: `scripts/vq2/race.py` (`closest_gate_pose`, `compute_looming` + integration),
-`guidance.py`, `eskf.py`.
+Files (2026-07-09 restructure note): the original implementation lived in the
+race-v1 controller, now `archive/vq2_experiments/race_v1/race.py`
+(`closest_gate_pose`, `compute_looming`). The decision itself still governs: the
+active deployment (`drone_racing.deployments.vq2`) relies on racing-line precision
++ map-gated association, not 3D avoidance.

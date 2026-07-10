@@ -1,41 +1,52 @@
 # AI Grand Prix — Autonomous Drone Racing Stack
 
 Autonomous FPV drone racing stack for the [Anduril AI Grand Prix 2026](https://theaigrandprix.com/).
+Monocular RGB camera + IMU only — no depth, no GPS, no ground-truth telemetry.
 
-## Quick Start
+**Active phase: VQ2** (Virtual Qualifier 2). See [docs/project/status.md](docs/project/status.md)
+for current state.
+
+## Quick start
 
 ```bash
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Clone and install
-git clone https://github.com/YOUR_USERNAME/ai-grand-prix.git
-cd ai-grand-prix
+# Install dependencies
 uv sync --all-extras
 
-# Run tests
-uv run pytest
+# Launch the VQ2 simulator from .local/simulators/vq2/ (Windows, Training mode),
+# start a run, then fly the mission:
+uv run aigp-vq2 --attempts 3 --secs 60
+```
 
-# VQ2 (active): verify control primitives against the sim (Training mode, run live)
-uv run python scripts/vq2/control_check.py --test rates --calib
+## Supported commands
 
-# Mock-sim pipeline (offline development)
-uv run python scripts/pre_sim/run_sim.py --config config/default.toml
+| Command | Purpose |
+|---|---|
+| `aigp-vq2` | fly the active VQ2 mission |
+| `aigp-calibrate` | verify the rate/thrust command calibration |
+| `aigp-replay` | flight-log / trace visualization |
+| `aigp-train-detector` | gate-detector training + data generation |
+| `aigp-benchmark` | pipeline latency benchmarks |
+
+See [docs/reference/command-line.md](docs/reference/command-line.md).
+
+## Tests
+
+```bash
+uv run pytest                     # all active tests
+uv run pytest -m "not simulation" # skip live-sim tests
 ```
 
 ## Architecture
 
 ```
-Camera Frame → Gate Detection → PnP Pose → ESKF Fusion → Guidance/MPCC → Rate Commands (MAVLink)
+Camera Frame → Gate Detection → PnP Pose → ESKF Fusion → Planner/Guidance → Calibrated Rate Commands (MAVLink)
 ```
 
-See `docs/ROADMAP.txt` for the development roadmap and status, `docs/RESEARCH.txt` for
-technical research, `docs/CODE_MAP.md` for what lives where, and `NEXT_SESSION.md` for
-the current working-session handoff.
-
-## Claude Code
-
-This project is optimized for development with Claude Code. See `CLAUDE.md` for project context and `.claude/` for MCP configs, slash commands, and hooks.
+- [Architecture reference](docs/reference/architecture.md)
+- [Project status](docs/project/status.md)
+- [Official VQ2 spec](docs/reference/specifications/vq2/summary.md)
+  ([original PDF](docs/reference/specifications/vq2/original.pdf))
+- [Documentation index](docs/index.md)
 
 ## License
 

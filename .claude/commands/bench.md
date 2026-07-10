@@ -5,7 +5,8 @@ allowed-tools:
   - Read
 ---
 
-Run performance benchmarks: `uv run pytest tests/ --benchmark-only -v`
+Run performance benchmarks: `uv run aigp-benchmark` (or the underlying
+`uv run pytest --benchmark-only -v`).
 
 After results, analyze:
 1. Is total pipeline latency under 40ms target?

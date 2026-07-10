@@ -2,9 +2,13 @@
 
 ## Status
 
-Accepted (2026-07-09). Supersedes the reactive-branch approach in `scripts/vq2/fly.py`
-for course navigation; fly.py remains the fallback controller and the source of the
-proven low-level primitives (calibrated rates, Flight failsafes, CY vertical servo).
+Accepted (2026-07-09). Supersedes the reactive-branch approach of the old `fly.py`
+controller for course navigation. (2026-07-09 restructure note: the reactive
+controller is archived at `archive/vq2_experiments/reactive_fly/`; its proven
+low-level primitives — calibrated rates, Flight failsafes, CY vertical servo — were
+extracted into `drone_racing.deployments.vq2.runtime`. The mission executor
+described below is `drone_racing.deployments.vq2.mission`, run as `aigp-vq2`; the
+course-map miner is `drone_racing.deployments.vq2.mapping`.)
 
 ## Context
 

@@ -2,18 +2,15 @@
   "permissions": {
     "allow": [
       "Read(**)",
-      "Write(drone_racing/**)",
+      "Write(src/**)",
       "Write(tests/**)",
-      "Write(scripts/**)",
-      "Write(config/**)",
+      "Write(deployments/**)",
       "Write(docs/**)",
+      "Write(tools/**)",
       "Bash(uv run *)",
       "Bash(python *)",
       "Bash(git *)",
       "Bash(docker *)"
-    ],
-    "deny": [
-      "Write(drone_racing/control/safety.py)"
     ]
   },
   "hooks": {
