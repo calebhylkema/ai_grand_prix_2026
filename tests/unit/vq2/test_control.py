@@ -174,13 +174,13 @@ def _render_gate(phi_deg: float) -> np.ndarray:
     """A world-upright 2.7m gate 8m ahead as seen by a body banked ``phi_deg`` right.
 
     World is NED-ish (x fwd, y right, z down); the gate centre sits where the
-    20-deg-down camera looks, so the ring lands mid-frame.
+    20-deg-UP camera looks (above body-horizontal), so the ring lands mid-frame.
     """
     phi = math.radians(phi_deg)
     r_wb = np.array(  # body->world: pure roll about x
         [[1, 0, 0], [0, math.cos(phi), -math.sin(phi)], [0, math.sin(phi), math.cos(phi)]]
     )
-    ctr = np.array([8.0, 0.0, 8.0 * math.tan(math.radians(20.0))])
+    ctr = np.array([8.0, 0.0, -8.0 * math.tan(math.radians(20.0))])
     h = gates.GATE_OUTER_M / 2
     corners = [
         ctr + np.array([0, sy * h, sz * h]) for sy, sz in ((-1, -1), (1, -1), (1, 1), (-1, 1))

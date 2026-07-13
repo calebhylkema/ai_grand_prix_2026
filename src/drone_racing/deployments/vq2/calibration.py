@@ -32,6 +32,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import socket
 import struct
@@ -43,12 +44,17 @@ import cv2
 import numpy as np
 from pymavlink import mavutil
 
+from drone_racing.deployments.vq2.vision import FrameReassembler
+
 MAVLINK_ENDPOINT = "udpin:127.0.0.1:14550"
 VISION_PORT = 5600
 VISION_HEADER = "<IHHIIQ"
 MAVLINK_CMD_SIM_RESET = 31000
 CMD_HZ = 60.0
 HOVER_THRUST = 0.30  # working estimate; the hover test refines it
+IMU_FIFO_MAX = 512  # timestamped IMU ring buffer depth (drained by the shadow worker)
+IMU_GAP_US = 20000  # inter-sample gap beyond this (~2x median 7 ms) counts as a gap
+FRAME_Q_MAX = 8  # shadow frame queue depth; when full the worker drops STALE frames
 
 # --- rate-command calibration (measured 2026-07-01 via --test rates) ---
 # The sim's rate loop responds INVERTED and ~2.5x scaled: actual_gyro ≈ GAIN * commanded.
@@ -66,8 +72,34 @@ class Shared:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.imu: tuple[float, float, float, float, float, float] | None = None
+        # timestamped IMU FIFO for the shadow worker: (sensor_usec, arrival_ns, ax..gz).
+        # Two clocks: HIGHRES_IMU.time_usec drives integration dt; monotonic_ns at receipt
+        # is the common clock the shadow worker uses to order IMU against camera frames.
+        self.imu_fifo: collections.deque[
+            tuple[int, int, float, float, float, float, float, float]
+        ] = collections.deque(maxlen=IMU_FIFO_MAX)
+        self.imu_fifo_overflow = 0  # samples dropped because the consumer fell behind
+        self.imu_dup_ts = 0  # consecutive samples with identical time_usec
+        self.imu_backward_ts = 0  # time_usec went backwards
+        self.imu_gaps = 0  # inter-sample gaps > IMU_GAP_US
+        self._imu_last_us = -1
         self.frame: np.ndarray | None = None
         self.frame_id = -1
+        self.frame_time_ns = -1  # sim_time_ns of the latest decoded frame (spec §4.6 header)
+        # bounded shadow frame queue: (frame_id, sensor_ns, arrival_ns, wall_ns, active_gate,
+        # image). arrival_ns=monotonic and wall_ns=time.time_ns() are BOTH captured at
+        # receipt (wall lets the worker map the camera epoch → capture-time latency).
+        # active_gate is snapshotted AT RECEIPT. The worker drops STALE frames on backlog.
+        self.frame_q: collections.deque[tuple[int, int, int, int, int, np.ndarray]] = (
+            collections.deque(maxlen=FRAME_Q_MAX)
+        )
+        self.frame_q_dropped = 0
+        self.frame_q_hwm = 0
+        self.active_att = (
+            0.0,
+            0.0,
+            0.0,
+        )  # published control attitude (roll,pitch,yaw) for shadow cmp
         self.race_start_ms = -1
         self.race_finish_ns = -1
         self.sim_boot_ms = 0
@@ -81,6 +113,78 @@ class Shared:
             return False
         return self.sim_boot_ms >= self.race_start_ms
 
+    def push_imu(
+        self,
+        ts: int,
+        arrival_ns: int,
+        ax: float,
+        ay: float,
+        az: float,
+        gx: float,
+        gy: float,
+        gz: float,
+    ) -> None:
+        """Append one timestamped IMU sample to the FIFO, tracking stream health.
+
+        ``ts`` is the sensor ``time_usec`` (integration dt); ``arrival_ns`` is the common
+        monotonic receipt clock. Preserves arrival order; counts duplicate/backward
+        timestamps, large gaps, and FIFO overflow (the deque evicts the oldest on append).
+        """
+        with self.lock:
+            self.imu = (ax, ay, az, gx, gy, gz)
+            if self._imu_last_us >= 0:
+                d = ts - self._imu_last_us
+                if d == 0:
+                    self.imu_dup_ts += 1
+                elif d < 0:
+                    self.imu_backward_ts += 1
+                elif d > IMU_GAP_US:
+                    self.imu_gaps += 1
+            if len(self.imu_fifo) == IMU_FIFO_MAX:
+                self.imu_fifo_overflow += 1  # deque will evict the oldest on append
+            self.imu_fifo.append((ts, arrival_ns, ax, ay, az, gx, gy, gz))
+            self._imu_last_us = ts
+
+    def push_frame(
+        self,
+        frame_id: int,
+        sensor_ns: int,
+        arrival_ns: int,
+        image: np.ndarray,
+        wall_ns: int | None = None,
+    ) -> None:
+        """Enqueue a unique completed camera frame for the shadow worker (log-only path).
+
+        ``sensor_ns`` is the camera ``sim_time_ns`` (capture epoch); ``arrival_ns`` is the
+        common monotonic receipt clock; ``wall_ns`` is ``time.time_ns()`` at receipt (used
+        to measure transport latency; defaults to ``arrival_ns``). ``active_gate`` is
+        snapshotted here (at receipt). The bounded deque drops the oldest frame on overflow.
+        """
+        if wall_ns is None:
+            wall_ns = arrival_ns
+        with self.lock:
+            if len(self.frame_q) == FRAME_Q_MAX:
+                self.frame_q_dropped += 1
+            self.frame_q.append((frame_id, sensor_ns, arrival_ns, wall_ns, self.active_gate, image))
+            self.frame_q_hwm = max(self.frame_q_hwm, len(self.frame_q))
+
+    def clear_shadow_queues(self) -> None:
+        """Drop pre-attempt queued IMU/frames and reset shadow-stream counters.
+
+        Called at an explicit attempt boundary so startup/pre-attempt samples never enter
+        a new ESKF or recording. The active-control ``imu`` tuple is preserved.
+        """
+        with self.lock:
+            self.imu_fifo.clear()
+            self.frame_q.clear()
+            self.imu_fifo_overflow = 0
+            self.imu_dup_ts = 0
+            self.imu_backward_ts = 0
+            self.imu_gaps = 0
+            self.frame_q_dropped = 0
+            self.frame_q_hwm = 0
+            self._imu_last_us = -1
+
 
 def mav_rx(conn: mavutil.mavfile, sh: Shared) -> None:
     while not sh.stop.is_set():
@@ -90,8 +194,16 @@ def mav_rx(conn: mavutil.mavfile, sh: Shared) -> None:
             continue
         t = msg.get_type()
         if t == "HIGHRES_IMU":
-            with sh.lock:
-                sh.imu = (msg.xacc, msg.yacc, msg.zacc, msg.xgyro, msg.ygyro, msg.zgyro)
+            sh.push_imu(
+                int(getattr(msg, "time_usec", 0)),
+                time.monotonic_ns(),  # common receipt clock for shadow ordering
+                msg.xacc,
+                msg.yacc,
+                msg.zacc,
+                msg.xgyro,
+                msg.ygyro,
+                msg.zgyro,
+            )
         elif t == "COLLISION":
             with sh.lock:
                 sh.collisions += 1
@@ -106,8 +218,12 @@ def mav_rx(conn: mavutil.mavfile, sh: Shared) -> None:
 
 
 def vision_rx(sh: Shared) -> None:
-    header_sz = struct.calcsize(VISION_HEADER)
-    frames: dict[int, dict] = {}
+    """Live camera receiver: dedup-aware reassembly, each frame id decoded once.
+
+    Uses the shared :class:`~drone_racing.deployments.vq2.vision.FrameReassembler` so
+    late/duplicate UDP chunks cannot re-decode a completed frame.
+    """
+    reasm = FrameReassembler()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", VISION_PORT))
@@ -117,19 +233,13 @@ def vision_rx(sh: Shared) -> None:
             packet, _ = sock.recvfrom(65536)
         except TimeoutError:
             continue
-        h, payload = packet[:header_sz], packet[header_sz:]
-        fid, cid, total, _js, _ps, _ts = struct.unpack(VISION_HEADER, h)
-        f = frames.setdefault(fid, {"c": {}, "n": total})
-        f["c"][cid] = payload
-        if len(f["c"]) == f["n"] and all(i in f["c"] for i in range(f["n"])):
-            buf = bytearray()
-            for i in range(f["n"]):
-                buf.extend(f["c"][i])
-            img = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
-            del frames[fid]
-            if img is not None:
-                with sh.lock:
-                    sh.frame, sh.frame_id = img, fid
+        cf = reasm.push(packet)
+        if cf is not None:
+            arrival_ns = time.monotonic_ns()  # common receipt clock for shadow ordering
+            wall_ns = time.time_ns()  # wall clock → camera transport-latency measurement
+            with sh.lock:
+                sh.frame, sh.frame_id, sh.frame_time_ns = cf.image, cf.frame_id, cf.sim_time_ns
+            sh.push_frame(cf.frame_id, cf.sim_time_ns, arrival_ns, cf.image, wall_ns)  # → worker
 
 
 def send_att(conn, tgt_sys, tgt_comp, lock, thr, rr, pr, yr) -> None:

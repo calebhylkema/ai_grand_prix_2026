@@ -44,13 +44,13 @@ import numpy as np
 from pymavlink import mavutil
 
 from drone_racing.deployments.vq2 import perception
+from drone_racing.deployments.vq2.vision import FrameReassembler
 from drone_racing.utils.workspace import Workspace
 
 MAVLINK_ENDPOINT = "udpin:127.0.0.1:14550"
 VISION_IP = "0.0.0.0"
 VISION_PORT = 5600
-VISION_HEADER = "<IHHIIQ"
-MAX_FRAMES_TO_SAVE = 5
+MAX_FRAMES_TO_SAVE = 15  # first N unique consecutive frames saved for offline PnP
 
 _WS = Workspace.locate()
 FRAME_DIR = _WS.datasets / "vq2" / "recon_frames"
@@ -61,10 +61,9 @@ LAB_OUT_DIR = _WS.datasets / "vq2" / "lab"
 # ---------------------------------------------------------------------------
 # recon
 # ---------------------------------------------------------------------------
-def vision_listener(stop: threading.Event, saved: list[int]) -> None:
-    """Reassemble chunked JPEG frames from UDP 5600 and save a handful as PNG."""
-    header_sz = struct.calcsize(VISION_HEADER)
-    frames: dict[int, dict] = {}
+def vision_listener(stop: threading.Event, reasm: FrameReassembler, saved: list[int]) -> None:
+    """Reassemble chunked JPEG frames from UDP 5600 (dedup-aware) and save the first
+    ``MAX_FRAMES_TO_SAVE`` UNIQUE frames as PNG. Stream health accumulates in ``reasm.stats``."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -74,33 +73,79 @@ def vision_listener(stop: threading.Event, saved: list[int]) -> None:
         return
     sock.settimeout(0.5)
     FRAME_DIR.mkdir(parents=True, exist_ok=True)
-    count = 0
     while not stop.is_set():
         try:
             packet, _ = sock.recvfrom(65536)
         except TimeoutError:
             continue
-        header, payload = packet[:header_sz], packet[header_sz:]
-        frame_id, chunk_id, total_chunks, _jpeg_sz, _pl_sz, _ts = struct.unpack(
-            VISION_HEADER, header
-        )
-        f = frames.setdefault(frame_id, {"chunks": {}, "total": total_chunks})
-        f["chunks"][chunk_id] = payload
-        if len(f["chunks"]) == f["total"]:
-            if all(i in f["chunks"] for i in range(f["total"])):
-                buf = bytearray()
-                for i in range(f["total"]):
-                    buf.extend(f["chunks"][i])
-                img = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
-                if img is not None:
-                    count += 1
-                    if len(saved) < MAX_FRAMES_TO_SAVE:
-                        p = FRAME_DIR / f"frame_{frame_id:06d}.png"
-                        cv2.imwrite(str(p), img)
-                        saved.append(frame_id)
-                        print(f"[vision] saved {p.name}  shape={img.shape}")
-            del frames[frame_id]
-    print(f"[vision] complete frames decoded: {count}")
+        cf = reasm.push(packet)
+        if cf is not None and len(saved) < MAX_FRAMES_TO_SAVE:
+            p = FRAME_DIR / f"frame_{cf.frame_id:06d}.png"
+            cv2.imwrite(str(p), cf.image)
+            saved.append(cf.frame_id)
+
+
+def _report_imu_time_usec(times: list[int], duration: float) -> None:
+    """Summarize HIGHRES_IMU.time_usec: is it real, monotonic, usable for per-sample dt?"""
+    if not times:
+        print("  no HIGHRES_IMU samples received")
+        return
+    n = len(times)
+    nonzero = sum(1 for t in times if t > 0)
+    distinct = len(set(times))
+    print(
+        f"  samples={n} (~{n / duration:.0f} Hz wall)  nonzero={nonzero}/{n}  distinct={distinct}"
+    )
+    if nonzero < n or distinct <= 1:
+        print("  -> ZERO/CONSTANT: NOT usable; the ESKF must fall back to arrival-clock dt")
+        return
+    t = np.asarray(times, float)
+    steps = np.diff(t)
+    mono = bool(np.all(steps >= 0))
+    diffs = steps[steps > 0] * 1e-6  # positive inter-sample dt (seconds)
+    span_s = (t[-1] - t[0]) * 1e-6
+    med = float(np.median(diffs))
+    print(
+        f"  timestamp span={span_s:.2f}s  rate_from_span={(n - 1) / span_s:.1f} Hz  monotonic={mono}"
+    )
+    print(
+        f"  dt(ms): mean={diffs.mean() * 1e3:.2f}  median={med * 1e3:.2f}  "
+        f"p95={np.quantile(diffs, 0.95) * 1e3:.2f}  max={diffs.max() * 1e3:.2f}"
+    )
+    gaps2x = int(np.count_nonzero(diffs >= 2.0 * med))
+    print(f"  gaps >= 2x median dt: {gaps2x}  (median rate ~{1.0 / med:.0f} Hz)")
+    ok = mono and distinct > n * 0.5
+    print(f"  -> {'USABLE for per-sample dt' if ok else 'SUSPECT; verify before trusting'}")
+
+
+def _archive_recon_frames() -> None:
+    """Move any existing recon frames into a timestamped subdir so a new capture starts
+    clean (old frames must not enter the geometry report)."""
+    existing = sorted(FRAME_DIR.glob("frame_*.png"))
+    if not existing:
+        return
+    dest = FRAME_DIR / f"prev_{time.strftime('%Y%m%d_%H%M%S')}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for p in existing:
+        p.rename(dest / p.name)
+    print(f"[recon] archived {len(existing)} stale frames → {dest.name}")
+
+
+def _report_stream(reasm: FrameReassembler, duration: float) -> None:
+    """Report vision-stream freshness: unique FPS, dup/stale, invalid, expiries, gaps."""
+    s = reasm.stats
+    print("\nVision stream (dedup-aware reassembly):")
+    print(
+        f"  unique frames decoded={s.unique_decoded}  "
+        f"(~{s.unique_decoded / duration:.1f} Hz wall, ~{s.fps():.1f} Hz by sim-clock)"
+    )
+    print(
+        f"  duplicate/stale chunks={s.dup_stale_chunks}  invalid={s.invalid_chunks}  "
+        f"incomplete expired={s.incomplete_expired}  decode failures={s.decode_failures}"
+    )
+    print(
+        f"  frame-id gaps={s.frame_id_gaps}  timestamp gaps(>1.5x)={s.ts_gaps}  resets={s.resets}"
+    )
 
 
 def recon(duration: float) -> None:
@@ -112,13 +157,16 @@ def recon(duration: float) -> None:
     conn.wait_heartbeat()
     print(f"Heartbeat received. target_system={conn.target_system}\n")
 
+    _archive_recon_frames()  # so stale frames cannot contaminate this capture
     stop = threading.Event()
     saved: list[int] = []
-    vt = threading.Thread(target=vision_listener, args=(stop, saved), daemon=True)
+    reasm = FrameReassembler()
+    vt = threading.Thread(target=vision_listener, args=(stop, reasm, saved), daemon=True)
     vt.start()
 
     counts: collections.Counter[str] = collections.Counter()
     samples: dict[str, object] = {}
+    imu_times: list[int] = []  # HIGHRES_IMU.time_usec — gates the ESKF timing design
     track_reported = False
 
     t0 = time.time()
@@ -145,11 +193,13 @@ def recon(duration: float) -> None:
             continue
         counts[mtype] += 1
 
-        if mtype == "HIGHRES_IMU" and "HIGHRES_IMU" not in samples:
-            samples["HIGHRES_IMU"] = (
-                f"accel=({msg.xacc:+.2f},{msg.yacc:+.2f},{msg.zacc:+.2f}) m/s^2  "
-                f"gyro=({msg.xgyro:+.3f},{msg.ygyro:+.3f},{msg.zgyro:+.3f}) rad/s"
-            )
+        if mtype == "HIGHRES_IMU":
+            imu_times.append(int(getattr(msg, "time_usec", 0)))
+            if "HIGHRES_IMU" not in samples:
+                samples["HIGHRES_IMU"] = (
+                    f"accel=({msg.xacc:+.2f},{msg.yacc:+.2f},{msg.zacc:+.2f}) m/s^2  "
+                    f"gyro=({msg.xgyro:+.3f},{msg.ygyro:+.3f},{msg.zgyro:+.3f}) rad/s"
+                )
         elif mtype in ("ATTITUDE", "ODOMETRY", "LOCAL_POSITION_NED") and mtype not in samples:
             # If these ever fire, VQ2 did NOT actually remove them — flag loudly.
             samples[mtype] = f"!!! PRESENT (spec says removed): {msg.to_dict()}"
@@ -192,20 +242,96 @@ def recon(duration: float) -> None:
         status = "!!! STILL PRESENT" if k in counts else "absent [OK]"
         print(f"  {k:20s} {status}")
 
-    print(f"\nCamera frames saved: {len(saved)} → {FRAME_DIR}")
+    print("\nHIGHRES_IMU.time_usec (gates the per-sample ESKF timing design):")
+    _report_imu_time_usec(imu_times, duration)
+
+    _report_stream(reasm, duration)
+    print(f"\nCamera frames saved: {len(saved)} unique → {FRAME_DIR}")
     print("=" * 60)
 
 
 # ---------------------------------------------------------------------------
 # lab
 # ---------------------------------------------------------------------------
-def lab(frames_dir: Path, annotate: int) -> None:
-    """Run the current perception stack offline over saved frames and report."""
+def _draw_structured(
+    img: np.ndarray,
+    cands: list[perception.GateObservation],
+    selected: perception.GateObservation | None,
+) -> None:
+    """Overlay candidates, corners, the selected active target, and PnP info."""
+    for o in cands:
+        x, y, w, h = o.bbox
+        is_sel = selected is not None and o.track_id == selected.track_id
+        full = o.visibility is perception.Visibility.FULL
+        color = (0, 0, 255) if is_sel else ((0, 255, 0) if full else (0, 180, 255))
+        cv2.rectangle(img, (x, y), (x + w, y + h), color, 3 if is_sel else 1)
+        for corners, ccol in ((o.outer_corners, (255, 255, 255)), (o.inner_corners, (255, 255, 0))):
+            if corners is not None:
+                for px, py in corners:
+                    cv2.circle(img, (int(px), int(py)), 3, ccol, -1)
+        label = o.output_mode.value
+        if o.pose_cam is not None:
+            label += f" z{o.pose_cam[2]:.1f}m r{o.reproj_rms:.1f}"
+        elif o.reject_reason:
+            label += f" ({o.reject_reason})"
+        cv2.putText(img, label, (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+
+def _lab_structured(files: list[Path], annotate: int) -> None:
+    """Run detect_candidates + GateTracker + solve_gate_pose over frames (temporal order)."""
+    tracker = perception.GateTracker()
+    n_cand = n_full = n_partial = n_posed = n_selected = 0
+    annotated = 0
+    if annotate:
+        LAB_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        img = cv2.imread(str(f))
+        if img is None:
+            continue
+        cands = perception.detect_candidates(img)
+        for obs in cands:
+            perception.solve_gate_pose(obs)
+        selected = tracker.step(cands)  # active_gate index is unknown offline
+        n_cand += len(cands)
+        n_full += sum(o.visibility is perception.Visibility.FULL for o in cands)
+        n_partial += sum(o.visibility is perception.Visibility.PARTIAL for o in cands)
+        n_posed += sum(o.pose_cam is not None for o in cands)
+        n_selected += selected is not None
+        parts = []
+        for o in cands:
+            tag = "F" if o.visibility is perception.Visibility.FULL else "P"
+            sel = "*" if (selected is not None and o.track_id == selected.track_id) else ""
+            z = f" z{o.pose_cam[2]:.1f}" if o.pose_cam is not None else ""
+            parts.append(f"{sel}{tag}[{o.output_mode.value}] b{math.degrees(o.bearing):+.0f}{z}")
+        print(f"  {f.name}: {'; '.join(parts) if parts else '(none)'}")
+        if annotate and annotated < annotate:
+            vis = img.copy()
+            _draw_structured(vis, cands, selected)
+            cv2.imwrite(str(LAB_OUT_DIR / f.name), vis)
+            annotated += 1
+    print(
+        f"\nSummary: {n_cand} candidates over {len(files)} frames "
+        f"(FULL={n_full} PARTIAL={n_partial} posed={n_posed}); active target in {n_selected} frames"
+    )
+    if annotated:
+        print(f"Annotated {annotated} frames → {LAB_OUT_DIR}")
+
+
+def lab(frames_dir: Path, annotate: int, structured: bool = False) -> None:
+    """Run the perception stack offline over saved frames and report.
+
+    ``structured=True`` runs the new pipeline (``detect_candidates`` + ``GateTracker`` +
+    ``solve_gate_pose``) with temporal continuity and richer overlays; otherwise the
+    legacy ``detect``/``detect_line`` path.
+    """
     files = sorted(p for p in frames_dir.glob("*.png")) + sorted(frames_dir.glob("*.jpg"))
     if not files:
         print(f"No frames (*.png / *.jpg) in {frames_dir}")
         return
     print(f"{len(files)} frames from {frames_dir}")
+    if structured:
+        _lab_structured(files, annotate)
+        return
     n_gate = n_posed = n_line = 0
     annotated = 0
     if annotate:
@@ -245,6 +371,44 @@ def lab(frames_dir: Path, annotate: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# replay
+# ---------------------------------------------------------------------------
+def replay(run_path: Path) -> None:
+    """Re-run the ESKF over a recorded ``.npz`` (ARRIVAL-order) and report diagnostics.
+
+    Arrival-order replay reproduces live fuse-in-receive-order behaviour (incl. camera
+    transport/decode latency); it is NOT exact capture-time delayed fusion.
+    """
+    from drone_racing.deployments.vq2.recorder import load_run, replay_arrival_order
+
+    res = replay_arrival_order(load_run(run_path))
+    print(f"Arrival-order replay of {run_path}")
+    print(f"  IMU: predicts={res.n_predict}  dup(dt<=0)={res.n_dup}  drop(gap)={res.n_drop}")
+    n_updates = res.n_fix_seen - res.reanchors
+    rate = res.n_fix_accepted / n_updates if n_updates else 1.0
+    print(
+        f"  fixes: seen={res.n_fix_seen}  reanchors={res.reanchors}  "
+        f"accepted={res.n_fix_accepted}/{n_updates} ({rate:.0%})"
+    )
+    if res.nis:
+        nis = np.array(res.nis)
+        print(f"  NIS: median={np.median(nis):.2f}  p95={np.quantile(nis, 0.95):.2f}")
+    if len(res.pos):
+        hs = res.horizontal_speed
+        print(
+            f"  final pos={np.round(res.pos[-1], 2)}  vel={np.round(res.vel[-1], 2)} m/s  "
+            f"euler(deg)={np.round(np.degrees(res.euler[-1]), 1)}"
+        )
+        print(f"  horizontal speed: max={hs.max():.2f}  final={hs[-1]:.2f} m/s")
+    for gate, vel in sorted(res.vel_at_gate_change.items()):
+        v = np.array(vel)
+        print(
+            f"  @ active_gate={gate}: world v={np.round(v, 2)} m/s  "
+            f"|v_horiz|={np.hypot(v[0], v[1]):.2f}"
+        )
+
+
+# ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="VQ2 diagnostics: telemetry recon + perception lab.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -263,12 +427,22 @@ def main(argv: list[str] | None = None) -> None:
     ap_lab.add_argument(
         "--annotate", type=int, default=0, metavar="N", help="write N annotated frames to lab dir"
     )
+    ap_lab.add_argument(
+        "--structured",
+        action="store_true",
+        help="use the new detect_candidates+tracker+PnP pipeline",
+    )
+
+    ap_replay = sub.add_parser("replay", help="re-run the ESKF over a recorded .npz run")
+    ap_replay.add_argument("run", type=Path, help="path to a recorded run .npz")
 
     args = ap.parse_args(argv)
     if args.cmd == "recon":
         recon(args.secs)
+    elif args.cmd == "replay":
+        replay(args.run)
     else:
-        lab(args.frames_dir, args.annotate)
+        lab(args.frames_dir, args.annotate, args.structured)
 
 
 if __name__ == "__main__":

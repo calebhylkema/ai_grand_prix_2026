@@ -53,6 +53,9 @@ from drone_racing.deployments.vq2 import calibration as cc
 from drone_racing.deployments.vq2 import config as vq2_config
 from drone_racing.deployments.vq2 import perception as gates
 from drone_racing.deployments.vq2 import runtime
+from drone_racing.deployments.vq2.recorder import RunRecorder
+from drone_racing.deployments.vq2.shadow import ShadowWorker
+from drone_racing.utils.workspace import Workspace
 
 if TYPE_CHECKING:
     from drone_racing.deployments.vq2.config import MissionParams, VQ2Config
@@ -141,6 +144,8 @@ def run(fl: runtime.Flight, cfg: VQ2Config) -> str:
         with fl.sh.lock:
             frame = fl.sh.frame
             gate_now = fl.sh.active_gate
+        # NOTE: the shadow ESKF/perception runs entirely on ShadowWorker's own thread
+        # (fed by the receiver queues); the command loop below does NO shadow work.
         if gate_now != gate_prev:
             print(f"  [gate] active_gate -> {gate_now}  t={now - t0:.1f}s  (phase {phase})")
             if gate_prev >= 0:  # real pass (not the initial latch): corner plan begins
@@ -282,6 +287,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     ap.add_argument("--secs", type=float, default=None, help="attempt duration cap (s)")
     ap.add_argument("--attempts", type=int, default=None)
+    ap.add_argument(
+        "--record",
+        action="store_true",
+        help="record the shadow IMU+PnP log (.npz) for offline ESKF replay (log-only)",
+    )
     args = ap.parse_args(argv)
     with contextlib.suppress(Exception):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
@@ -315,8 +325,30 @@ def main(argv: list[str] | None = None) -> None:
             if not cc.wait_fresh(sh, conn, tgt_sys, tgt_comp, lock):
                 print("NO FRESH START — is a run live in the Training window?")
                 return
+            sh.clear_shadow_queues()  # explicit attempt boundary: drop pre-attempt IMU/frames
             fl = runtime.Flight(sh, conn, tgt_sys, tgt_comp, lock)
-            if run(fl, cfg) == "FINISHED":
+            recorder = RunRecorder() if args.record else None
+            worker = ShadowWorker(sh, recorder)  # log-only shadow ESKF on its own thread
+            fl.shadow = worker
+            worker.start()
+            try:
+                stop_reason = run(fl, cfg)
+            finally:
+                worker.stop()  # request finish; wait_done confirms full termination below
+            terminated = worker.wait_done()
+            print(f"[fly2] {fl.summary()}")  # control estimators only
+            if not terminated:
+                # do NOT read worker state or save: the thread may still be mutating them
+                print("[shadow] ERROR: worker did not terminate in time; recording NOT saved")
+            else:
+                print(f"[fly2] {worker.summary()}")  # shadow filter-health (log-only)
+                if recorder is not None and recorder.n_imu:
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    path = recorder.save(Workspace.locate().runs / "vq2_shadow" / f"run_{ts}.npz")
+                    print(
+                        f"[shadow] recorded {recorder.n_imu} IMU + {recorder.n_fix} fixes → {path}"
+                    )
+            if stop_reason == "FINISHED":
                 print("🎉 course FINISHED")
                 break
     finally:

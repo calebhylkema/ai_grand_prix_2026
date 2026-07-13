@@ -34,11 +34,12 @@ import numpy as np
 from drone_racing.deployments.vq2 import calibration as cc
 from drone_racing.deployments.vq2 import perception as gates
 from drone_racing.deployments.vq2.attitude import AttitudeEstimator, VelocityEstimator
-from drone_racing.deployments.vq2.eskf import ESKF
 from drone_racing.utils.workspace import Workspace
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from drone_racing.deployments.vq2.shadow import ShadowWorker
 
 _WS = Workspace.locate()
 COLL_DUMP_DIR = _WS.datasets / "vq2" / "fly_collisions"
@@ -520,13 +521,6 @@ class Flight:
         self.tgt = (tgt_sys, tgt_comp)
         self.att = AttitudeEstimator()
         self.vel = VelocityEstimator()
-        # SHADOW-MODE ESKF (07-05): fed IMU + gate fixes, LOGGED, never steered on.
-        # Config AI proved the blind arc needs a real velocity (the simple integrator
-        # underread corner-entry speed ⇒ the "matched" arc flew near-straight into the
-        # threats). Next session compares kf speed vs the integrator in the traces,
-        # then flips blind_arc_cmd onto kf velocity if it's sane.
-        self.kf = ESKF()
-        self.kf_needs_anchor = True  # reanchor on first fix / after active-gate change
         self.vz = 0.0  # world-frame descent rate (m/s, +down), IMU-integrated
         self.gyro_z = 0.0  # latest body yaw rate (rad/s), for bearing de-rotation
         self.vz_min = 0.0  # most-negative (climb) seen
@@ -538,10 +532,18 @@ class Flight:
         self.tilt_max = 0.0
         self.gyro_sq_sum = np.zeros(3)
         self.n = 0
+        # Optional reference to the log-only shadow worker (set by mission), read ONLY for
+        # diagnostics (trace filenames + summary). The command loop does no shadow work;
+        # all shadow ESKF/perception runs on ShadowWorker's own thread.
+        self.shadow: ShadowWorker | None = None
 
     # -- per-loop primitives -------------------------------------------------
     def step_sensors(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """Re-arm, read IMU, advance the attitude filter. None if no IMU yet."""
+        """Re-arm, read IMU, advance the attitude + velocity estimators. None if no IMU yet.
+
+        Control-only: the shadow ESKF/perception is handled entirely by ShadowWorker on a
+        separate thread, so this stays off the shadow path and holds ~60 Hz.
+        """
         now = time.time()
         if now - self.last_arm > 0.4:
             cc.arm(self.conn, *self.tgt, self.lock)
@@ -557,13 +559,6 @@ class Flight:
         self.gyro_z = float(gyro[2])  # body yaw rate — de-rotates gate bearing drift
         self.att.update(gyro, acc, dt)
         self.vel.predict(acc, self.att.R, dt)
-        self.kf.predict(acc, gyro, dt)  # shadow ESKF: log-only this session
-        if not self.att.in_flight:
-            # Shadow batch 1 (07-05): update_gravity in flight re-created the CRUISE
-            # LIE (|a|≈1.05g passes its 1.5 m/s² gate, erased ~12° of real nose-down
-            # pitch ⇒ kf speed read 0.3–0.8 mid-corner vs the vision-anchored
-            # integrator's 4–6). Ground-only, exactly like AttitudeEstimator.
-            self.kf.update_gravity(acc)
         self.vz = float(np.clip(self.vel.v[2], -VZ_CLAMP, VZ_CLAMP))
         self.vz_min = min(self.vz_min, self.vz)
         self.vz_max = max(self.vz_max, self.vz)
@@ -571,6 +566,8 @@ class Flight:
         self.tilt_max = max(self.tilt_max, abs(roll), abs(pitch))
         self.gyro_sq_sum += gyro**2
         self.n += 1
+        with self.sh.lock:  # publish control attitude for the shadow worker's comparison log
+            self.sh.active_att = self.att.euler
         return acc, gyro
 
     def command(self, thr: float, rr: float, pr: float, yr: float) -> None:
@@ -620,14 +617,13 @@ class Flight:
         if coll and last is not None:
             kind = {1001: "GATE", 1002: "ENV"}.get(last[0], str(last[0]))
             what = f" last_coll={kind}/threat{last[1]}"
-        kr, kp, _ = (math.degrees(v) for v in self.kf.euler)
         ar, ap, _ = (math.degrees(v) for v in self.att.euler)
         return (
             f"tilt_max={math.degrees(self.tilt_max):.1f}deg "
             f"gyro_rms=({rms[0]:.2f},{rms[1]:.2f},{rms[2]:.2f}) "
             f"vz=[{self.vz_min:+.1f},{self.vz_max:+.1f}]m/s "
             f"coll={coll}{what} active_gate={gate} loops={self.n} "
-            f"kf_att=({kr:+.0f},{kp:+.0f})/att=({ar:+.0f},{ap:+.0f})deg"  # shadow sanity
+            f"att=({ar:+.0f},{ap:+.0f})deg"  # control estimators only; shadow health is separate
         )
 
 
@@ -812,13 +808,15 @@ def _trace_frame(
             f"_L{'F' if on_line else ''}a{math.degrees(line.aim_bearing):+.0f}"
             f"f{math.degrees(line.far_bearing):+.0f}y{line.aim_cy:.0f}"
         )
-    # shadow ESKF vs simple integrator (07-05): K = kf horiz speed + kf vz,
-    # I = integrator horiz speed (integrator vz is already the vz field).
-    kh = float(np.hypot(fl.kf.v[0], fl.kf.v[1]))
+    # shadow ESKF (worker) vs simple integrator: K = kf horiz speed + kf vz,
+    # I = integrator horiz speed. kf lives on the shadow worker (diagnostic read only);
+    # 0 if no worker is attached.
+    kf_v = fl.shadow.velocity_snapshot() if fl.shadow is not None else np.zeros(3)
+    kh = float(np.hypot(kf_v[0], kf_v[1]))
     ih = float(np.hypot(fl.vel.v[0], fl.vel.v[1]))
     name = (
         f"{idx:03d}_t{t_rel:.2f}_r{roll_d:+.0f}p{pitch_d:+.0f}"
         f"_vz{fl.vz:+.1f}_gz{fl.gyro_z:+.2f}_g{gate}"
-        f"_K{kh:.1f}z{fl.kf.v[2]:+.1f}I{ih:.1f}_{g}.png"
+        f"_K{kh:.1f}z{kf_v[2]:+.1f}I{ih:.1f}_{g}.png"
     )
     cv2.imwrite(str(tdir / name), frame)

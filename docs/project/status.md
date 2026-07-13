@@ -48,24 +48,24 @@ drifts +34→+42° while yawing right at MAX_YAW with bank clamped → "target l
 re-scan → collide with floor clutter. Different thrust profiles did not change it.
 The problem is perception or planning, **not control**.
 
-## 🚨 Critical open question — camera tilt sign
+## ✅ Resolved — camera tilt is 20° UP (2026-07-10)
 
-- **Spec (VADR-TS-003 §3.8):** "camera is tilted upwards by 20°."
-- **Our code implements 20° DOWN** (`_TILT = −20°` in the VQ2 perception module),
-  justified 2026-07-03 from live imagery (level hover put the horizon at y≈64 with
-  floor filling the frame) — but that reading was never re-examined.
-- If the code is wrong, **all PnP poses are geometrically inverted** and the THREAD
-  "gate 1" may be the wrong object entirely. This could explain 10 days of stalled
-  control tuning.
-
-**Validation plan (do this first):**
-1. Flip the tilt sign to +20° (up, per spec); run gate 0 — it should break or fix
-   things consistently.
-2. Overlay detections + PnP poses + bearing lines on trace frames; compare against
-   the mined course map geometry.
-3. Use the VQ1 sim (`.local/simulators/vq1/`, still broadcasts ODOMETRY/ATTITUDE)
-   as a ground-truth rig: if PnP is correct there with DOWN, and VQ2 differs, the
-   builds differ.
+- **Spec (VADR-TS-003 §3.8):** "camera is tilted upwards by 20°." **This is correct.**
+- The code implemented **20° DOWN** (`_TILT = −20°` in `deployments/vq2/perception.py`)
+  — **wrong**, being flipped to `+20°`.
+- The 07-03 "DOWN" reading (floor filling the frame at "level" hover) was **confounded
+  by the rest pitch**: the VQ2 hover pose is already nose-down ~18° (attitude filter
+  reads −17.8° from the start accel `(-3,0,-9.34)`), so a 20°-up camera on an 18°-down
+  body points near-horizontal and the floor fills the lower frame anyway. Physics
+  agrees: forward flight needs nose-down pitch, so a 20°-up mount looks straight ahead.
+- **Consequence:** prior PnP-derived **bearing, `range_m`, `up_body`/`vision_roll`**
+  were geometrically inverted (camera-frame `pose_cam` was fine). Any `mission.py`
+  tuning leaning on those body-frame quantities is suspect — re-baseline gate 0 after
+  the flip. A projection/sign unit test now guards the correct sign.
+- Being corrected as step 1 of the combined perception+ESKF repair
+  (`~/.claude/plans/tier-a-offline-tilt-rippling-fiddle.md`); confirm on a live gate-0
+  run + offline replay. VQ1 sim (`.local/simulators/vq1/`, still broadcasts
+  ODOMETRY/ATTITUDE) remains the ground-truth cross-check.
 
 ## Next technical milestones (ordered)
 

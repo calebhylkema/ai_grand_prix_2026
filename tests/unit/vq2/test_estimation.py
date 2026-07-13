@@ -134,7 +134,11 @@ def _run_synthetic(seed: int = 0) -> tuple[float, float, float]:
         a_m = rmat.T @ (a_world - np.array([0, 0, G])) + ba_true + rng.normal(0, sig_a, 3)
         w_m = omega + bg_true + rng.normal(0, sig_g, 3)
         kf.predict(a_m, w_m, dt)
-        kf.update_gravity(a_m)
+        # Gravity aiding is only valid near-static (specific force ≈ g); feeding it
+        # mid-maneuver injects motion accel into attitude. Real flight gates this to the
+        # ground; the synthetic mirrors that discipline.
+        if abs(float(np.linalg.norm(a_m)) - G) < 0.1:
+            kf.update_gravity(a_m)
         if k % 3 == 0 and t > 0.05:
             z = -rmat.T @ p + rng.normal(0, sig_pnp, 3)
             if k == 6:  # first gate obs: anchor (large initial innovation), then fuse
@@ -154,9 +158,11 @@ def _run_synthetic(seed: int = 0) -> tuple[float, float, float]:
 
 
 def test_eskf_recovers_synthetic_trajectory() -> None:
+    # Tightened after the covariance/Joseph repair (was 0.4/0.4/5.0 with the ~100×
+    # under-scaled process noise); the corrected filter tracks measurably better.
     perr, verr, terr = _run_synthetic()
-    assert perr < 0.4, f"position error too high: {perr}"
-    assert verr < 0.4, f"velocity error too high: {verr}"
+    assert perr < 0.35, f"position error too high: {perr}"
+    assert verr < 0.30, f"velocity error too high: {verr}"
     # yaw is only weakly observable (gate updates get chi2-gated during the maneuver);
     # roll/pitch stay good via gravity. 5deg is fine — we steer by gate bearing anyway.
     assert terr < 5.0, f"attitude error too high: {terr}"
