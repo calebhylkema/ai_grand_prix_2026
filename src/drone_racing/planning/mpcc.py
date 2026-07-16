@@ -83,6 +83,7 @@ class MPCCConfig:
     w_input: float = 0.05
     w_input_rate: float = 0.1
     max_progress_per_step: float = 0.03
+    max_solve_time_ms: float = 50.0
     dynamics: DynamicsConfig = field(default_factory=DynamicsConfig)
     solver_opts: dict[str, object] = field(default_factory=dict)
 
@@ -108,11 +109,14 @@ class MPCCSolution:
     """
 
     success: bool
+    converged: bool
     states: np.ndarray
     inputs: np.ndarray
     progress: np.ndarray
     cost: float
     solve_time_ms: float
+    deadline_met: bool
+    solver_status: str
 
 
 class MPCCSolver:
@@ -130,7 +134,7 @@ class MPCCSolver:
         self,
         racing_line: RacingLine,
         config: MPCCConfig | None = None,
-        closed: bool = True,
+        closed: bool = False,
     ) -> None:
         self._cfg = config or MPCCConfig()
         self._racing_line = racing_line
@@ -416,7 +420,7 @@ class MPCCSolver:
         n = self._cfg.horizon
         hover_thrust = self._cfg.dynamics.mass * 9.81 / self._cfg.dynamics.max_thrust
 
-        if self._prev_solution is not None and self._prev_solution.success:
+        if self._prev_solution is not None and self._prev_solution.converged:
             # Shift previous solution forward by one step.
             # Use RK4 to propagate the last state (keeps dynamics consistent).
             prev = self._prev_solution
@@ -525,7 +529,8 @@ class MPCCSolver:
 
         # --- Extract solution ---
         w_opt = np.array(sol["x"]).flatten()
-        success = self._solver.stats()["success"]
+        solver_stats = self._solver.stats()
+        solver_success = bool(solver_stats["success"])
         cost = float(sol["f"])
 
         states = np.zeros((n + 1, NX))
@@ -542,18 +547,34 @@ class MPCCSolver:
                 inputs[k, :] = w_opt[offset : offset + NU]
                 offset += NU
 
-        # Save primal + dual for warm-starting next solve
+        finite = bool(
+            np.all(np.isfinite(states))
+            and np.all(np.isfinite(inputs))
+            and np.all(np.isfinite(progress))
+            and np.isfinite(cost)
+        )
+        deadline_met = solve_time_ms <= self._cfg.max_solve_time_ms
+        converged = solver_success and finite
+        success = converged and deadline_met
+
+        # A converged solution that missed the flight deadline must never receive command
+        # authority (``success`` remains false), but it is still numerically safe and useful
+        # as the next solver's warm start. Discarding it forced every subsequent solve to
+        # cold-start and turned one startup miss into a permanent deadline failure.
         self._w0 = w_opt
-        self._prev_lam_g = np.array(sol["lam_g"]).flatten()
-        self._prev_lam_x = np.array(sol["lam_x"]).flatten()
+        self._prev_lam_g = np.array(sol["lam_g"]).flatten() if converged else None
+        self._prev_lam_x = np.array(sol["lam_x"]).flatten() if converged else None
 
         result = MPCCSolution(
             success=success,
+            converged=converged,
             states=states,
             inputs=inputs,
             progress=progress,
             cost=cost,
             solve_time_ms=solve_time_ms,
+            deadline_met=deadline_met,
+            solver_status=str(solver_stats.get("return_status", "unknown")),
         )
         self._prev_solution = result
 
@@ -572,7 +593,7 @@ class MPCCSolver:
     def from_planner_config(
         racing_line: RacingLine,
         planner_config: PlannerConfig,
-        closed: bool = True,
+        closed: bool = False,
     ) -> MPCCSolver:
         """Create an MPCCSolver from the standard PlannerConfig.
 

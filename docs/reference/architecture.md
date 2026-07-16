@@ -12,7 +12,7 @@ Camera Frame → Gate Detection → PnP Pose → ESKF Fusion → Planner/Guidanc
 src/drone_racing/        installed package (import name: drone_racing)
   perception/            gate detection (classical, neural, PnP, tracker, hybrid)
   estimation/            16-state ESKF + gate mapper (pre-sim lineage)
-  planning/              B-spline racing line + MPCC (p95 22 ms warm-started)
+  planning/              arc-length reference, VQ2 model contract, legacy MPCC
   control/               PID cascade, RL policy, MPCC adapter, rate limiter
   sim/                   sim adapters: pymavlink (live), mock (offline)
   logging/               flight logger + frame recorder
@@ -31,14 +31,18 @@ archive/                 historical rounds + superseded VQ2 controllers (not in 
 
 | Module | Role |
 |---|---|
-| `mission.py` | ⭐ active runner — map-and-plan phased executor (ADR-0003) |
+| `mission.py` | ⭐ active legacy phased runner; depth/turn association, no trajectory planner |
 | `runtime.py` | Flight runtime: sensor stepping, calibrated command boundary, level-rate controller, tilt compensation, aborts/failsafes, thrust helpers, trace recorder |
 | `perception.py` | glow-resistant gate detection (ring test) + cyan-line detection + PnP |
 | `attitude.py` | Mahony attitude filter + velocity integrator |
-| `eskf.py` | 15-state visual-inertial ESKF, gate-as-landmark (validated) |
+| `eskf.py` | 15-state visual-inertial ESKF, gate-as-landmark (shadow; not guidance-ready) |
 | `guidance.py` | geometric acceleration→attitude controller |
 | `calibration.py` | control-primitive probe; source of truth for RATE_GAIN `(−2.55, −2.55, −2.35)` |
 | `mapping.py` | offline course-map miner (co-visible PnP gate pairs from traces) |
+| `course_map.py` | versioned map loader, validation, and flight-readiness gate |
+| `reference.py` | open-course reference construction and shadow evaluation |
+| `shadow.py` | background perception/ESKF diagnostics; no command authority |
+| `recorder.py` | dual-clock schema-v3 recording and arrival-order replay |
 | `diagnostics.py` | recon, offline detector lab, frame inspection |
 
 ### Why the deployment duplicates package modules
@@ -60,7 +64,7 @@ mandatory stack for the physical qualifier.
 | `perception/` | pre-sim | mainline for physical; VQ2 uses deployment-local detection |
 | `estimation/eskf.py` | pre-sim | 16-state; known frame-conversion drift — VQ2 filter is deployment-local |
 | `estimation/gate_mapper.py` | pre-sim | gate-map discovery; feeds MPCC handoff |
-| `planning/` | pre-sim | next up on the speed roadmap |
+| `planning/` | mixed | open reference + VQ2 NED model; MPCC is pre-sim/shadow-only |
 | `control/` | pre-sim | RL best_model @400k usable; PID gains were mock-sim tuned |
 | `sim/mavlink_adapter.py` | vq1 | live pymavlink adapter + RACE_STATUS/vision parsing |
 | `sim/mock_adapter.py` | pre-sim | offline mock for adapter-contract tests |
@@ -84,5 +88,9 @@ superseded by the pymavlink adapter since 2026-06-01.)
 | Camera capture | 1–5 ms | 5 ms |
 | Detection (classical / neural) | 5 / 17 ms | 20 ms |
 | PnP + ESKF update | 1–3 ms | 5 ms |
-| Planning (MPCC solve) | 10–20 ms | 25 ms |
+| Shadow planning | 10–20 ms | 25 ms |
 | Command generation | <1 ms | 2 ms |
+
+The historical MPCC benchmark (~18 ms median / ~23 ms p95 on this laptop) uses a
+synthetic closed course and legacy dynamics. It is a compute benchmark, not proof that
+MPCC is safe or compatible with VQ2.

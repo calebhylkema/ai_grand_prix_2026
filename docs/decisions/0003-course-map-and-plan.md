@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (2026-07-09). Supersedes the reactive-branch approach of the old `fly.py`
+Refined by [ADR-0004](0004-planning-promotion-ladder.md) (2026-07-13). The strategic
+map-first direction remains accepted, but the original map values are historical and
+not flight-ready. Supersedes the reactive-branch approach of the old `fly.py`
 controller for course navigation. (2026-07-09 restructure note: the reactive
 controller stays runnable at `scripts/vq2/fly.py` until a live gate-0 regression
 revalidates the extraction, then moves to `archive/vq2_experiments/reactive_fly/`;
@@ -26,10 +28,10 @@ Forensics on the AX batch found the structural cause, not a tuning cause:
   "closure"). Nothing in the stack knows where gates actually are, so data
   association is by image continuity only, and the controller flew the corner chord
   toward second-leg gates, into the corner scaffold/jet.
-- **Geometric blindness to gate 1.** The camera is 20° DOWN; frame row 0 is only
-  ~9° above body-horizontal. Gate 1 is ~0.6 m above gate 0's center, and we cross
-  gate 0 sinking — the real gate 1 is physically out of frame (top) exactly when the
-  reactive stack needs it, while the 21–23 m imposters are in frame.
+- **Historical interpretation, later corrected.** This ADR originally assumed a
+  20°-down camera and attributed gate-1 loss to geometric blindness. The spec and
+  corrected implementation use 20° up; the old reading was confounded by body pitch.
+  The blindness/climb conclusion must not be reused as established geometry.
 - A full-pipeline audit found the one architecture box absent from the active
   stack: a gate map feeding a planner. State-of-the-art monocular racing systems
   (MonoRace, Swift) all fly a pre-built track map; perception corrects the plan
@@ -46,12 +48,14 @@ roll/pitch leveling — the vertical component and separation are yaw-invariant)
    saved fly_trace archives for PnP-valid gate observations and co-visible pairs;
    write `.local/datasets/vq2/map/observations.csv`. Map v0 (3 independent co-visible pairs across
    6 runs): gate 1 is 9.2 m fwd / 6.4 m right of gate 0 (34.8° right, 11.2 m
-   horizontal), +0.6 m up; post-crossing sightings at z 21–23 m are gate 2.
+   horizontal), +0.6 m up. These three pairs came from the legacy perception pipeline;
+   later 24–27 m sightings were rejected by association constraints, so downstream
+   gate identity is unresolved rather than proven.
 2. **Map-based mission executor** (`drone_racing.deployments.vq2.mission`,
    run as `aigp-vq2`): phased plan instead of
    per-frame re-decision — thread gate 0 (proven servo), then on the RACE_STATUS
    gate-pass event: BRAKE hard (deep flare; we exit the catapulted gate-0 pass hot)
-   while CLIMBING ~2 m (so the 20°-down camera can see the elevated gate 1), SCAN
+   while applying the then-tested arrest profile, SCAN
    right toward the mapped bearing, and **accept a detection as gate 1 only if its
    PnP range is inside the mapped band (3–16 m)** — map-gated data association that
    rejects the imposters by construction. Then THREAD with the standard CY servo.

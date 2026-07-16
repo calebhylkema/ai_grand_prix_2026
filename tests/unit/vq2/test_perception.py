@@ -125,6 +125,74 @@ def test_partial_gate_at_right_border_kept_as_bearing_only() -> None:
     assert math.degrees(obs.bearing) > 15.0, "gate to the right → positive bearing"
 
 
+def _rotated_ring_img(angle_deg: float, cx: int = 320, cy: int = 180, half: int = 80) -> np.ndarray:
+    """A red gate ring rotated in-plane by ``angle_deg`` (45° → a diamond)."""
+    img = np.zeros((360, 640, 3), np.uint8)
+    inner = half * gates.GATE_INNER_M / gates.GATE_OUTER_M
+    th = math.radians(angle_deg)
+    rot = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+
+    def sq(r: float) -> np.ndarray:
+        pts = np.array([[-r, -r], [r, -r], [r, r], [-r, r]], np.float64)
+        return np.round(pts @ rot.T + np.array([cx, cy])).astype(np.int32)
+
+    cv2.fillPoly(img, [sq(half)], (0, 0, 255))
+    cv2.fillPoly(img, [sq(inner)], (0, 0, 0))
+    return img
+
+
+def test_order_quad_robust_orders_rotated_diamond() -> None:
+    """The robust orderer returns four DISTINCT corners for a ~45° diamond (the legacy
+    sum/diff heuristic collapses two into one → a zero-length side → 'degenerate')."""
+    diamond = np.array([[544, 103], [485, 162], [552, 215], [632, 147]], np.float64)
+    out = gates._order_quad_robust(diamond)
+    assert out.shape == (4, 2)
+    assert len({tuple(p) for p in out}) == 4, "all four corners must be distinct"
+    # identical to the legacy order for an axis-aligned rectangle (gate 0 unaffected)
+    rect = np.array([[300, 200], [100, 50], [100, 200], [300, 50]], np.float64)
+    assert np.allclose(gates._order_quad_robust(rect), gates._order_quad(rect))
+
+
+def test_rotated_gate_recovers_metric_pose_not_degenerate() -> None:
+    """A fully-visible but in-plane-rotated (diamond) gate must yield a metric pose, not
+    collapse to 'degenerate' from the corner-ordering bug."""
+    cands = gates.detect_candidates(_rotated_ring_img(30.0))
+    assert len(cands) == 1
+    obs = gates.solve_gate_pose(cands[0])
+    assert obs.outer_corners is not None
+    assert gates._quad_min_side(obs.outer_corners) > gates._MIN_QUAD_SIDE_PX
+    assert obs.output_mode in (gates.OutputMode.POSITION_ONLY, gates.OutputMode.FULL_POSE)
+    assert obs.reject_reason != "degenerate"
+    assert obs.pose_cam is not None
+
+
+def test_border_clipped_outer_with_full_inner_opening_is_metric() -> None:
+    """Outer frame clipped at the right border but the inner opening fully in-frame →
+    metric pose from the REAL inner corners (no extrapolation); still PARTIAL/low-conf."""
+    # cx=580, half=80: outer spans x∈[500,660] (clipped at 640) but inner (~44) x∈[536,624]
+    img = _ring_img(cx=580, cy=180, half=80)
+    cands = gates.detect_candidates(img)
+    assert len(cands) == 1
+    obs = cands[0]
+    assert obs.visibility is gates.Visibility.PARTIAL
+    assert obs.outer_corners is None, "clipped outer corners are not gate corners"
+    assert obs.inner_corners is not None, "the fully-visible inner opening must be used"
+    gates.solve_gate_pose(obs)
+    assert obs.output_mode in (gates.OutputMode.POSITION_ONLY, gates.OutputMode.FULL_POSE)
+    assert obs.pose_cam is not None and obs.solver == "inner4"
+
+
+def test_border_clipped_with_clipped_inner_stays_bearing_only() -> None:
+    """When the inner opening ALSO crosses the border, no metric pose is manufactured."""
+    # cx=615: inner (~44) right edge 659 > 640 → inner clipped too
+    obs = gates.detect_candidates(_ring_img(cx=615, cy=180, half=80))[0]
+    assert obs.visibility is gates.Visibility.PARTIAL
+    assert obs.inner_corners is None and obs.outer_corners is None
+    gates.solve_gate_pose(obs)
+    assert obs.output_mode is gates.OutputMode.BEARING_ONLY
+    assert obs.pose_cam is None
+
+
 # --- persistent identity: GateTracker -----------------------------------------
 
 
@@ -183,6 +251,90 @@ def test_tracker_does_not_let_downstream_gate_steal_identity() -> None:
         )
         assert sel is not None and sel.track_id == a_tid
     assert len(tr.tracks) == 2  # both tracked, but identity stayed with the active gate
+
+
+def test_tracker_confirms_next_gate_without_stealing_active() -> None:
+    tr = gates.GateTracker()
+    active_id = _establish(tr, 200.0).track_id
+    result = None
+    for _ in range(4):
+        result = tr.step_result(
+            [_obs(205.0, conf=0.5), _obs(500.0, conf=0.95)],
+            active_gate_index=0,
+            next_turn_sign=+1.0,
+        )
+    assert result is not None and result.active is not None and result.next is not None
+    assert result.active.track_id == active_id
+    assert result.next.track_id != active_id and result.next.bearing > 0.0
+    assert result.next.track_streak >= gates._SWITCH_CONFIRM
+
+
+def test_tracker_promotes_confirmed_next_identity_on_gate_advance() -> None:
+    tr = gates.GateTracker()
+    passed_id = _establish(tr, 200.0).track_id
+    result = None
+    for _ in range(4):
+        result = tr.step_result(
+            [_obs(205.0), _obs(500.0)],
+            active_gate_index=0,
+            next_turn_sign=+1.0,
+        )
+    assert result is not None and result.next is not None
+    next_id = result.next.track_id
+    advanced = tr.step_result(
+        [_obs(205.0), _obs(500.0)],
+        active_gate_index=1,
+        expected_turn_sign=+1.0,
+    )
+    assert advanced.promoted_track_id == next_id
+    assert advanced.active is not None and advanced.active.track_id == next_id
+    assert advanced.active.race_gate_id == 1 and next_id != passed_id
+    assert advanced.active.track_streak > result.next.track_streak
+
+
+def test_tracker_provisional_is_direction_only_and_never_range_gated() -> None:
+    tr = gates.GateTracker()
+    _establish(tr, 200.0)
+    result = None
+    for _ in range(4):
+        active, far = _obs(205.0), _obs(500.0)
+        far.pose_cam = (20.0, 0.0, 25.0)  # far beyond gate-1's 16 m fusion band
+        result = tr.step_result(
+            [active, far],
+            active_gate_index=0,
+            next_turn_sign=+1.0,
+        )
+    assert result is not None and result.next is not None
+    assert result.next.slant_range is not None and result.next.slant_range > 16.0
+
+
+def test_tracker_wrong_side_never_becomes_provisional() -> None:
+    tr = gates.GateTracker()
+    _establish(tr, 400.0)  # active right of centre; alternate is left
+    result = None
+    for _ in range(5):
+        result = tr.step_result(
+            [_obs(400.0), _obs(100.0)],
+            active_gate_index=0,
+            next_turn_sign=+1.0,
+        )
+    assert result is not None and result.active is not None and result.next is None
+
+
+def test_tracker_stale_provisional_is_not_promoted() -> None:
+    tr = gates.GateTracker()
+    _establish(tr, 200.0)
+    for _ in range(4):
+        result = tr.step_result(
+            [_obs(205.0), _obs(500.0)],
+            active_gate_index=0,
+            next_turn_sign=+1.0,
+        )
+    assert result.next is not None
+    for _ in range(gates._MAX_MISSES + 1):
+        tr.step_result([_obs(205.0)], active_gate_index=0, next_turn_sign=+1.0)
+    advanced = tr.step_result([_obs(205.0)], active_gate_index=1, expected_turn_sign=+1.0)
+    assert advanced.promoted_track_id is None and advanced.active is None
 
 
 def test_tracker_survives_brief_dropout() -> None:
@@ -319,6 +471,13 @@ def test_gate_normal_convention_is_physical() -> None:
     # the recovered orientation matches truth (chosen the physical, not the mirror)
     expected_up = gates.CAM_TO_BODY @ (r_true @ np.array([0.0, 1.0, 0.0]))
     assert np.allclose(np.array(obs.up_body), expected_up, atol=0.1)
+
+
+def test_gate_observation_vision_roll_uses_frd_right_wing_down_sign() -> None:
+    obs = _obs(320.0)
+    phi = math.radians(30.0)
+    obs.up_body = (0.0, -math.sin(phi), -math.cos(phi))
+    assert obs.vision_roll is not None and math.isclose(obs.vision_roll, phi)
 
 
 def test_pose_cov_rotates_to_body_weak_axis() -> None:
@@ -459,3 +618,117 @@ def test_pnp_prefers_inner_when_outer_edge_inconsistent() -> None:
     gates.solve_gate_pose(obs)
     assert obs.solver == "inner4"
     assert obs.pose_cam is not None and abs(obs.pose_cam[2] - 7.0) < 0.2  # inner → correct range
+
+
+# ------------------------------------------------- identity-continuity guard (Phase 1)
+def _metric_obs(
+    cx: float,
+    cy: float = 120.0,
+    area: float = 26000.0,
+    slant: float = 5.0,
+    bearing_deg: float = 1.0,
+    conf: float = 0.9,
+) -> gates.GateObservation:
+    """A posed (POSITION_ONLY) observation with an explicit slant range + bearing."""
+    o = _obs(cx, cy, area, conf)
+    o.bearing = math.radians(bearing_deg)
+    o.pose_cam = (0.0, 0.0, slant)  # ‖pose_cam‖ = slant_range
+    o.output_mode = gates.OutputMode.POSITION_ONLY
+    return o
+
+
+def _establish_close(tr: gates.GateTracker, cx: float = 340.0, n: int = 5) -> int:
+    sel = None
+    for _ in range(n):
+        sel = tr.step([_metric_obs(cx, slant=5.0, bearing_deg=1.0)], active_gate_index=0)
+    assert sel is not None
+    return sel.track_id
+
+
+def test_identity_jump_5m_to_22m_rejected() -> None:
+    # The recorded defect: gate-0 track (posed ~5 m/1°) absorbs a downstream ~22 m/+38° gate.
+    tr = gates.GateTracker()
+    active_id = _establish_close(tr)
+    far = _metric_obs(383.0, cy=95.0, area=30000.0, slant=22.0, bearing_deg=38.0)
+    res = tr.step_result([far], active_gate_index=0)
+    assert tr.identity_jumps_rejected >= 1
+    assert far.reject_reason == "active_identity_jump"
+    # the far gate did NOT become the active gate-0 observation, and did not keep the id
+    assert res.active is None
+    assert far.track_id != active_id  # it spawned its own (downstream) track
+
+
+def test_identity_jump_normal_close_motion_retained() -> None:
+    tr = gates.GateTracker()
+    active_id = _establish_close(tr)
+    # gentle approach: range 5→4.6 m, bearing 1→3° — must NOT be rejected
+    sel = tr.step([_metric_obs(348.0, slant=4.6, bearing_deg=3.0)], active_gate_index=0)
+    assert tr.identity_jumps_rejected == 0
+    assert sel is not None and sel.track_id == active_id
+
+
+def test_identity_jump_bearing_only_near_gate_retained() -> None:
+    # A close gate legitimately degrades to bearing-only (no range) as it clips at the plane;
+    # that must NOT be treated as an identity jump.
+    tr = gates.GateTracker()
+    active_id = _establish_close(tr)
+    sel = tr.step([_obs(360.0, cy=140.0, area=60000.0, conf=0.9)], active_gate_index=0)
+    assert tr.identity_jumps_rejected == 0
+    assert sel is not None and sel.track_id == active_id
+
+
+def test_identity_jump_far_gate_available_as_provisional() -> None:
+    # After the guard refuses the far gate for the active id, it must remain trackable as the
+    # separate right-side provisional gate-1 identity.
+    tr = gates.GateTracker()
+    _establish_close(tr)
+    res = None
+    for _ in range(4):
+        res = tr.step_result(
+            [
+                _obs(360.0, cy=150.0, area=70000.0),  # near gate 0, now bearing-only/clipped
+                _metric_obs(400.0, cy=95.0, area=30000.0, slant=22.0, bearing_deg=40.0),  # gate 1
+            ],
+            active_gate_index=0,
+            next_turn_sign=+1.0,
+        )
+    assert res is not None and res.next is not None
+    assert res.next.bearing > 0.0 and res.next.track_streak >= gates._SWITCH_CONFIRM
+
+
+def test_identity_jump_does_not_erase_gate1_provisional_on_gate0_dropout() -> None:
+    tr = gates.GateTracker()
+    _establish_close(tr)
+    # confirm a provisional gate 1 alongside the active gate 0
+    res = None
+    for _ in range(4):
+        res = tr.step_result(
+            [_obs(360.0, cy=150.0, area=70000.0), _obs(470.0, cy=100.0, area=20000.0)],
+            active_gate_index=0,
+            next_turn_sign=+1.0,
+        )
+    assert res is not None and res.next is not None
+    prov_id = res.next.track_id
+    # gate 0 drops out (only the provisional remains visible) — provisional must survive
+    res2 = tr.step_result(
+        [_obs(470.0, cy=100.0, area=20000.0)], active_gate_index=0, next_turn_sign=+1.0
+    )
+    assert res2.next is not None and res2.next.track_id == prov_id
+
+
+def test_identity_jump_correct_promotion_still_passes() -> None:
+    # The guard must not break the normal same-id gate-0→1 provisional promotion.
+    tr = gates.GateTracker()
+    _establish_close(tr)
+    res = None
+    for _ in range(4):
+        res = tr.step_result(
+            [_obs(360.0, cy=150.0, area=70000.0), _obs(470.0, cy=100.0, area=20000.0)],
+            active_gate_index=0,
+            next_turn_sign=+1.0,
+        )
+    assert res is not None and res.next is not None
+    next_id = res.next.track_id
+    adv = tr.step_result([_obs(470.0, cy=100.0, area=20000.0)], active_gate_index=1)
+    assert adv.promoted_track_id == next_id
+    assert adv.active is not None and adv.active.track_id == next_id

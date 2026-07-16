@@ -195,10 +195,9 @@ VEL_FIX_RANGE_MAX = 10.0  # m — config AX (07-09): fixes may feed the ESTIMATO
 #   same px is ~0.12 m ⇒ tolerable. POSITION consumers (thr_m, accel_guidance,
 #   dr_target) keep the full FIX_RANGE_MAX — ±1 m position error is harmless there.
 # --- metric vertical (2026-07-03): hold the gate's PnP relative HEIGHT, not its image
-# row. The cy servo (CY_TARGET 130) conflates angle with height: with the 20°-down
-# camera, cy 130 for a 30m gate demands flying ~6m ABOVE it — the servo pegged max
-# climb all approach (ceiling collisions ×5, level flight) while pushing the gate out
-# the frame top. PnP body-z is trusted now (transform verified against sim imagery).
+# row. The cy servo (CY_TARGET 130) conflates angle with height; historical ceiling
+# collisions showed that image row alone is not a metric height target. The camera is
+# now correctly modeled as 20° up, so old down-camera geometry must not be reused.
 Z_DES_REL = 0.5  # m — keep the gate slightly BELOW us (down+); pass just above centre
 KZ_P = 0.05  # thrust per m of height error
 KZ_D = 0.08  # thrust per m/s of relative vertical rate (v_rel z damps the climb).
@@ -523,6 +522,7 @@ class Flight:
         self.vel = VelocityEstimator()
         self.vz = 0.0  # world-frame descent rate (m/s, +down), IMU-integrated
         self.gyro_z = 0.0  # latest body yaw rate (rad/s), for bearing de-rotation
+        self.body_gyro = (0.0, 0.0, 0.0)  # latest raw body rates (rad/s), for the bank observer
         self.vz_min = 0.0  # most-negative (climb) seen
         self.vz_max = 0.0  # most-positive (sink) seen
         self.t_prev = time.time()
@@ -536,6 +536,11 @@ class Flight:
         # diagnostics (trace filenames + summary). The command loop does no shadow work;
         # all shadow ESKF/perception runs on ShadowWorker's own thread.
         self.shadow: ShadowWorker | None = None
+        # Last command-boundary telemetry (Phase-4A observability, diagnostic only). Set by
+        # command(); keys req/des/cal each = (thr, roll, pitch, yaw) — requested,
+        # post-clamp desired ACTUAL rates, and calibrated raw command — kept SEPARATE so
+        # the inversion/scale cannot be applied twice in replay. sat = per-axis clamp flags.
+        self.last_cmd: dict[str, tuple[float, float, float, float]] | None = None
 
     # -- per-loop primitives -------------------------------------------------
     def step_sensors(self) -> tuple[np.ndarray, np.ndarray] | None:
@@ -557,6 +562,7 @@ class Flight:
         acc = np.array(imu[:3])
         gyro = np.array(imu[3:])
         self.gyro_z = float(gyro[2])  # body yaw rate — de-rotates gate bearing drift
+        self.body_gyro = (float(gyro[0]), float(gyro[1]), float(gyro[2]))  # raw body rates (rps)
         self.att.update(gyro, acc, dt)
         self.vel.predict(acc, self.att.R, dt)
         self.vz = float(np.clip(self.vel.v[2], -VZ_CLAMP, VZ_CLAMP))
@@ -572,10 +578,18 @@ class Flight:
 
     def command(self, thr: float, rr: float, pr: float, yr: float) -> None:
         """Single calibrated command boundary (desired ACTUAL body rates in, rad/s)."""
-        rr = float(np.clip(rr, -MAX_RATE, MAX_RATE))
-        pr = float(np.clip(pr, -MAX_RATE, MAX_RATE))
-        yr = float(np.clip(yr, -MAX_YAW, MAX_YAW))
-        cc.send_att(self.conn, *self.tgt, self.lock, thr, rr, pr, yr)
+        rr_c = float(np.clip(rr, -MAX_RATE, MAX_RATE))
+        pr_c = float(np.clip(pr, -MAX_RATE, MAX_RATE))
+        yr_c = float(np.clip(yr, -MAX_YAW, MAX_YAW))
+        # observability only — capture the three levels separately (behaviour unchanged:
+        # the same clamped rates are sent). cal = what send_att emits after calibration.
+        self.last_cmd = {
+            "req": (thr, float(rr), float(pr), float(yr)),
+            "des": (thr, rr_c, pr_c, yr_c),
+            "cal": (thr, *cc.desired_to_cmd(rr_c, pr_c, yr_c)),
+            "sat": (0.0, float(rr != rr_c), float(pr != pr_c), float(yr != yr_c)),
+        }
+        cc.send_att(self.conn, *self.tgt, self.lock, thr, rr_c, pr_c, yr_c)
 
     def tilt_comp(self, thr: float) -> float:
         """Scale thrust by 1/(cosR·cosP) so a banked/pitched turn holds altitude."""

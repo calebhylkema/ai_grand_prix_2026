@@ -1,45 +1,48 @@
 # Coordinate frames
 
-## VQ2 sim frames (spec VADR-TS-003 §3.7–3.8)
+## VQ2 simulator frames (VADR-TS-003 §3.7–3.8)
 
-- **World:** NED (`MAV_FRAME_LOCAL_NED`), origin = point on ground where the drone armed.
-- **Body:** FRD (X fwd, Y right, Z down), origin at center of mass. **Body → IMU = identity.**
-- **Camera:** OpenCV convention (X-right, Y-down, Z-forward), shares the body origin,
-  tilted 20° about pitch from the body axis.
+- **World:** NED; X north/local forward, Y east/local right, Z down.
+- **Body:** FRD; X forward, Y right, Z down, origin at the center of mass.
+- **IMU:** aligned with body FRD.
+- **Camera:** OpenCV X-right, Y-down, Z-forward, sharing the body origin.
 
-## 🚨 Camera tilt sign — OPEN QUESTION
+## Camera extrinsic — resolved
 
-- The **spec says 20° UP**.
-- The **code implements 20° DOWN**, based on a 2026-07-03 live-imagery reading
-  (level hover → horizon at y≈64 with floor filling the frame).
-- These cannot both be right; a wrong sign geometrically inverts every PnP pose.
-  See [status.md](../project/status.md) for the validation plan. Update this page
-  when resolved.
+The camera is tilted **20° up**, matching VADR-TS-003. The earlier down-tilt reading
+was confounded by the drone's roughly 18° nose-down rest/launch attitude. Projection
+and coupled-renderer tests guard the corrected sign.
 
-## Camera intrinsics (VQ2, hardcoded in the deployment)
+Camera intrinsics are pinhole/no distortion at 640×360: `fx=fy=320`, `cx=320`,
+`cy=180`. Predicting gate visibility requires both body attitude and the camera
+extrinsic; camera tilt alone does not establish that a gate is outside the image.
 
-Pinhole, no distortion. 640×360 @ 30 Hz, `[cx,cy] = [320,180]`, `[fx,fy] = [320,320]`,
-VFoV 90°. With 20° down-tilt, frame row 0 is only ~9° above body-horizontal — an
-elevated gate can be physically out of frame exactly when needed (a root cause of
-the gate-1 blindness; see ADR-0003).
+## Course-map frame
+
+Until an absolute world pose is observable, VQ2 course maps use
+`gate0_local_ned`: origin at gate 0, X along the verified gate-0 exit heading, Y
+right, and Z down. This is a yaw-anchored local NED frame, not a claim that the
+simulator's absolute north/east origin is known.
 
 ## Internal conventions
 
-- SI units internally (meters, radians, seconds); convert at boundaries only.
-- Quaternions scalar-last `[x, y, z, w]`, except scipy interfaces (scalar-first).
-- Gate poses `[x, y, z, qx, qy, qz, qw]` in world frame.
-- The pre-sim package pipeline used internal Z-up with NED conversion at the adapter
-  boundary (`utils/transforms.py: ned_to_enu` etc.). The VQ2 deployment works in
-  body/camera-relative terms and mostly avoids a world frame.
+- SI units internally; convert once at boundaries.
+- Quaternions scalar-last `[x, y, z, w]`.
+- Gate map centers and planning state are NED.
+- Body-rate commands use FRD signs before the calibrated command boundary.
+- `pose_cam[2]` is camera depth; `norm(pose_cam)` is slant range. Never label one as
+  the other.
+- The pre-sim legacy MPCC model is Z-up and is not compatible with VQ2 flight state.
+  `VQ2DynamicsConfig` is the NED/rate-thrust planning contract.
 
-## Vision stream wire format (UDP 5600)
+## Vision stream wire format
 
-Little-endian, 24-byte header `<IHHIIQ` =
-`frame_id(u32), chunk_id(u16), total_chunks(u16), jpeg_size(u32), payload_size(u32), sim_time_ns(u64)`,
-followed by a JPEG slice. Reassemble chunks by `frame_id`.
+UDP 5600 uses little-endian header `<IHHIIQ>`:
+`frame_id, chunk_id, total_chunks, jpeg_size, payload_size, sim_time_ns`, followed by
+a JPEG slice. Reassembly deduplicates completed frame IDs and preserves `sim_time_ns`.
 
-## Gate dimensions (VQ2)
+## Gate dimensions
 
-Inner opening (fly-through) **1.5 × 1.5 m**, outer frame 2.7 × 2.7 m, depth 0.26 m.
-Threading tolerance ≈ ±0.75 m half-width. Drone chassis 280×280×160 mm. Read gate
-dimensions from config — never hardcode.
+The VQ2 inner opening is 1.5×1.5 m, outer frame 2.7×2.7 m, depth 0.26 m, and drone
+chassis approximately 280×280×160 mm. Dimensions live in configuration/course-map
+data; planner code must not hardcode them.

@@ -78,8 +78,11 @@ uv run aigp-calibrate --test rates --calib          # verify control calibration
 - Dataclasses or Pydantic over raw dicts; NumPy vectorized ops over loops
 - Quaternions scalar-last `[x,y,z,w]` (scipy interfaces are scalar-first)
 - Coordinate frames: `docs/reference/coordinate-frames.md` — world NED, body FRD,
-  camera OpenCV convention. ⚠️ The camera tilt sign (spec: 20° up; code: 20° down)
-  is an open question — see status.md.
+  camera OpenCV convention. Camera tilt is resolved and guarded at **20° up**.
+- Course maps are versioned evidence. Historical/candidate maps must never receive
+  command authority; require `course_map.load_course_map(..., require_flight_ready=True)`.
+- The reusable MPCC is legacy/shadow-only and defaults to no command authority. Do
+  not connect it to VQ2 until ADR-0004's map/state/model/promotion gates pass.
 - Configuration: `docs/reference/configuration.md` — deployment configs under
   `deployments/vq2/configs/`, generated output under `.local/`
 - Significant design decisions get an ADR in `docs/decisions/` (Context, Decision,

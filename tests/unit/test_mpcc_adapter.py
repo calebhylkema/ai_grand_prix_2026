@@ -64,7 +64,9 @@ def _simple_racing_line() -> RacingLine:
     return build_racing_line(positions, orientations, PlannerConfig(), num_points=100, closed=True)
 
 
-def _build_mpcc_controller(racing_line: RacingLine | None = None) -> MPCCController:
+def _build_mpcc_controller(
+    racing_line: RacingLine | None = None, *, allow_command_authority: bool = True
+) -> MPCCController:
     """Build an MPCCController with a mock MPCC solver."""
     if racing_line is None:
         racing_line = _simple_racing_line()
@@ -82,6 +84,7 @@ def _build_mpcc_controller(racing_line: RacingLine | None = None) -> MPCCControl
         pid_controller=pid,
         control_config=control_cfg,
         attitude_tau=0.2,
+        allow_command_authority=allow_command_authority,
     )
 
 
@@ -220,6 +223,15 @@ class TestMPCCFallback:
         assert stats is not None
         assert stats.fallback_reason == FallbackReason.MPCC_OK
         assert stats.mpcc_success is True
+
+    def test_command_authority_is_disabled_by_default_contract(self) -> None:
+        ctrl = _build_mpcc_controller(allow_command_authority=False)
+        state = _make_state(ts=1_000_000, pos=(5.0, 0.0, 0.0))
+        command = ctrl.update(state)
+        assert 0.0 <= command.throttle <= 1.0
+        assert ctrl._mpcc.solve.call_count == 0
+        assert ctrl.last_stats is not None
+        assert ctrl.last_stats.fallback_reason == FallbackReason.SHADOW_ONLY
 
 
 class TestResetBehaviour:

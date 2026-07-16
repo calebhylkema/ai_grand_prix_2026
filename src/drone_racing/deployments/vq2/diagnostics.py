@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import itertools
 import math
 import socket
 import struct
@@ -408,6 +409,146 @@ def replay(run_path: Path) -> None:
         )
 
 
+def handoff(run_path: Path) -> None:
+    """Audit ESKF attitude convention and gate-0→1 identity continuity offline."""
+    from drone_racing.deployments.vq2.gate_relative import GateApproachLimits
+    from drone_racing.deployments.vq2.recorder import (
+        GYRO_SIGN,
+        load_run,
+        replay_arrival_order,
+        replay_handoff_identity,
+    )
+
+    data = load_run(run_path)
+    print(f"Handoff diagnostic of {run_path} (schema v{int(data['schema_version'])})")
+    ctrl_t = np.asarray(data["ctrl_mono_ns"], np.int64)
+    phase = np.asarray(data["ctrl_phase"]).astype(str)
+    active_att = np.asarray(data["ctrl_att"], float)
+    shadow_att = np.asarray(data["ctrl_sh_euler"], float)
+
+    def wrapped_deg(values: np.ndarray) -> np.ndarray:
+        return np.degrees(np.arctan2(np.sin(values), np.cos(values)))
+
+    print("\nAttitude by phase (degrees; active is comparison only, not ground truth):")
+    for name in ("STAB", "G0", "BRAKE", "SCAN", "THREAD"):
+        mask = phase == name
+        if not np.any(mask):
+            continue
+        delta = np.abs(wrapped_deg(shadow_att[mask] - active_att[mask]))
+        sh_min = np.degrees(shadow_att[mask]).min(axis=0)
+        sh_max = np.degrees(shadow_att[mask]).max(axis=0)
+        print(
+            f"  {name:6s}: shadow rpy min={np.round(sh_min, 1)} max={np.round(sh_max, 1)} "
+            f"|shadow-active| max={np.round(delta.max(axis=0), 1)}"
+        )
+    # The policy gates total body tilt, acos(R[2,2]) = acos(cos(roll)cos(pitch)),
+    # not the larger of the two Euler components.
+    tilt = np.arccos(np.clip(np.cos(shadow_att[:, 0]) * np.cos(shadow_att[:, 1]), -1.0, 1.0))
+    limit = GateApproachLimits().max_current_tilt_rad
+    over = np.flatnonzero(tilt > limit)
+    if len(over):
+        i = int(over[0])
+        elapsed = (int(ctrl_t[i]) - int(ctrl_t[0])) * 1e-9
+        print(
+            f"  first shadow tilt > {math.degrees(limit):.0f}°: "
+            f"t={elapsed:.3f}s phase={phase[i]} rpy={np.round(np.degrees(shadow_att[i]), 1)}"
+        )
+    else:
+        print(f"  shadow tilt never exceeds {math.degrees(limit):.0f}°")
+
+    imu_t = np.asarray(data["imu_arrival_t"], np.int64)
+    imu = np.asarray(data["imu"], float)
+    desired = np.asarray(data["ctrl_des"], float)[:, 1:4]
+    nearest = np.searchsorted(ctrl_t, imu_t, side="right") - 1
+    valid = nearest >= 0
+    print("\nDesired-actual rate vs raw reported gyro (response convention):")
+    for axis, label in enumerate("rpy"):
+        x = desired[nearest[valid], axis]
+        y = imu[valid, axis + 3]
+        moving = np.abs(x) > 0.05
+        if np.count_nonzero(moving) < 6 or float(x[moving] @ x[moving]) <= 0.0:
+            print(f"  {label}: insufficient excitation")
+            continue
+        corr = float(np.corrcoef(x[moving], y[moving])[0, 1])
+        slope = float((x[moving] @ y[moving]) / (x[moving] @ x[moving]))
+        print(f"  {label}: n={np.count_nonzero(moving)} corr={corr:+.3f} slope={slope:+.3f}")
+
+    print("\nAll gyro sign hypotheses (static-gate NIS is the physical landmark check):")
+    sign_results: list[tuple[tuple[float, float, float], float]] = []
+    for values in itertools.product((-1.0, 1.0), repeat=3):
+        signs = (values[0], values[1], values[2])
+        eskf_replay = replay_arrival_order(data, gyro_sign=signs)
+        median = float(np.median(eskf_replay.nis)) if eskf_replay.nis else float("inf")
+        updates = eskf_replay.n_fix_seen - eskf_replay.reanchors
+        rate = eskf_replay.n_fix_accepted / updates if updates else 1.0
+        marker = " *current" if np.array_equal(np.asarray(signs), GYRO_SIGN) else ""
+        print(f"  {signs}: NIS median={median:7.2f}, accepted={rate:6.1%}{marker}")
+        sign_results.append((signs, median))
+    best_nis = min(median for _signs, median in sign_results)
+    equivalence_tol = max(0.05, 0.01 * best_nis)
+    equivalent = [signs for signs, median in sign_results if median <= best_nis + equivalence_tol]
+    print(
+        f"  best-equivalent signs={equivalent} (median NIS={best_nis:.2f}, "
+        f"tol={equivalence_tol:.2f})"
+    )
+    axis_labels = ["roll", "pitch", "yaw"]
+    for axis, label in enumerate(axis_labels):
+        by_sign = {
+            sign: min(median for signs, median in sign_results if signs[axis] == sign)
+            for sign in (-1.0, 1.0)
+        }
+        delta = abs(by_sign[-1.0] - by_sign[1.0])
+        if delta <= equivalence_tol:
+            print(f"  {label}: unresolved by this landmark motion (dNIS={delta:.2f})")
+        else:
+            preferred = -1.0 if by_sign[-1.0] < by_sign[1.0] else 1.0
+            print(f"  {label}: prefers {preferred:+.0f} (dNIS={delta:.2f})")
+
+    if "frm_pnp_roll" in data:
+        roll = np.asarray(data["frm_pnp_roll"], float)
+        sh_roll = np.asarray(data["frm_shadow_att"], float)[:, 0]
+        frm_gate = np.asarray(data["frm_active_gate"], int)
+        frm_mode = np.asarray(data["frm_mode"]).astype(str)
+        metric = np.isin(frm_mode, ["position_only", "full_pose"])
+        valid_roll = np.isfinite(roll) & np.isfinite(sh_roll) & metric
+        for label, mask in (
+            ("gate 0 metric", valid_roll & (frm_gate == 0)),
+            ("gate 1 metric", valid_roll & (frm_gate == 1)),
+        ):
+            if not np.any(mask):
+                continue
+            residual = np.abs(wrapped_deg(sh_roll[mask] - roll[mask]))
+            print(
+                f"  PnP roll residual ({label}): median={np.median(residual):.2f}° "
+                f"p95={np.quantile(residual, 0.95):.2f}° n={len(residual)}"
+            )
+
+    print("\nPre-pass next-gate handoff:")
+    required = {
+        "ctrl_nt_valid",
+        "ctrl_nt_track",
+        "ctrl_nt_hits",
+        "ctrl_st_valid",
+        "ctrl_st_track",
+        "ctrl_st_hits",
+    }
+    if not required.issubset(data):
+        print("  unavailable before recorder schema v8")
+        return
+    try:
+        handoff = replay_handoff_identity(data)
+    except ValueError as exc:
+        print(f"  {exc}")
+        return
+    print(
+        f"  provisional rows={handoff.provisional_rows} "
+        f"last_id={handoff.provisional_track_id} hits={handoff.provisional_track_hits}; "
+        f"first active id={handoff.active_track_id} hits={handoff.active_track_hits}; "
+        f"identity_match={handoff.identity_match}; "
+        f"confirmation_preserved={handoff.confirmation_preserved}"
+    )
+
+
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="VQ2 diagnostics: telemetry recon + perception lab.")
@@ -436,11 +577,18 @@ def main(argv: list[str] | None = None) -> None:
     ap_replay = sub.add_parser("replay", help="re-run the ESKF over a recorded .npz run")
     ap_replay.add_argument("run", type=Path, help="path to a recorded run .npz")
 
+    ap_handoff = sub.add_parser(
+        "handoff", help="audit ESKF attitude convention and gate-0→1 track continuity"
+    )
+    ap_handoff.add_argument("run", type=Path, help="path to a schema-v7/v8 recorded run")
+
     args = ap.parse_args(argv)
     if args.cmd == "recon":
         recon(args.secs)
     elif args.cmd == "replay":
         replay(args.run)
+    elif args.cmd == "handoff":
+        handoff(args.run)
     else:
         lab(args.frames_dir, args.annotate, args.structured)
 

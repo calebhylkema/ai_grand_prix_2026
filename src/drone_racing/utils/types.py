@@ -346,6 +346,10 @@ class PlannerConfig:
     spline_smoothing: float = 0.5
     gate_approach_offset_m: float = 2.0
     max_velocity_mps: float = 25.0
+    min_velocity_mps: float = 1.0
+    max_lateral_accel_mps2: float = 8.0
+    max_longitudinal_accel_mps2: float = 4.0
+    max_braking_accel_mps2: float = 6.0
 
 
 @dataclass(slots=True)

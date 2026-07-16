@@ -126,6 +126,7 @@ def _build_pipeline(
             racing_line=racing_line,
             pid_controller=pid,
             control_config=config.control,
+            allow_command_authority=True,
         )
     except ImportError:
         logger.warning("CasADi not installed — MPCC benchmark will be skipped")

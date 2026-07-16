@@ -16,22 +16,61 @@ It never feeds attitude, guidance, thrust, safety, or command generation.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import cv2
 import numpy as np
 
+from drone_racing.deployments.vq2 import gate_relative as gr
 from drone_racing.deployments.vq2 import perception as gates
 from drone_racing.deployments.vq2 import recorder as recmod
 from drone_racing.deployments.vq2.eskf import ESKF
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from drone_racing.deployments.vq2.calibration import Shared
     from drone_racing.deployments.vq2.recorder import RunRecorder
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ShadowState:
+    """Atomic, immutable snapshot of the shadow ESKF for cross-thread diagnostic reads.
+
+    Published by the worker each tick under its state lock; the control thread reads it
+    (never the live ``kf``) so Phase-4A control telemetry can log the estimator alongside
+    each command without any shared-mutable-state race. Log-only — never feeds control.
+    """
+
+    anchor_gate: int = -1  # race gate the world origin is anchored to (-1 = not yet anchored)
+    initialised: bool = False  # attitude initialised (filter usable)
+    last_fix_mono_ns: int = 0  # monotonic_ns of the last fused fix (0 = none) → freshness
+    p: tuple[float, float, float] = (0.0, 0.0, 0.0)  # position rel. anchor gate (m)
+    v: tuple[float, float, float] = (0.0, 0.0, 0.0)  # world velocity (m/s)
+    euler: tuple[float, float, float] = (0.0, 0.0, 0.0)  # roll,pitch,yaw (rad)
+    cov_diag: tuple[float, ...] = field(  # P diagonal: pos(3), vel(3), att(3)
+        default_factory=lambda: (0.0,) * 9
+    )
+    sequence: int = 0
+    published_mono_ns: int = 0
+
+
+@dataclass(frozen=True)
+class CoherentShadowSnapshot:
+    """One atomically published estimator/target/guidance generation."""
+
+    state: ShadowState
+    target: gr.StructuredTarget
+    next_target: gr.StructuredTarget
+    decision: gr.GuidanceDecision
+
 
 IMU_MAX_DT = 0.1  # reject IMU dt above this (a dropout, not a step)
 _TICK_S = 0.002  # worker poll period
@@ -54,11 +93,18 @@ class ShadowWorker:
         recorder: RunRecorder | None = None,
         gate1_turn_sign: float = GATE1_TURN_SIGN,
         gate1_band: tuple[float, float] = GATE1_SLANT_BAND,
+        frame_dir: Path | None = None,
     ) -> None:
         self.sh = sh
         self.recorder = recorder
         self._gate1_turn_sign = gate1_turn_sign
         self._gate1_band = gate1_band
+        # Optional RAW-frame dump for offline perception analysis (diagnostic only). When
+        # set, each processed frame's untouched BGR image is written here AFTER the
+        # perception-latency window, so it never inflates proc_ms or the control loop.
+        self._frame_dir = frame_dir
+        if frame_dir is not None:
+            frame_dir.mkdir(parents=True, exist_ok=True)
         self.kf = ESKF()
         self.tracker = gates.GateTracker()
         self.kf_needs_anchor = True
@@ -66,8 +112,24 @@ class ShadowWorker:
         self._kf_active_gate = -1
         self._stop = threading.Event()  # per-attempt stop (Shared.stop is session-wide)
         self._done = threading.Event()  # set when the run loop has fully exited
-        self._state_lock = threading.Lock()  # guards the published velocity snapshot
+        self._state_lock = threading.Lock()  # guards the published snapshots
         self._v_pub = np.zeros(3)  # atomic velocity snapshot for the trace diagnostic
+        self._state_pub = ShadowState()  # atomic full-state snapshot (Phase-4A control log)
+        self._last_fix_mono_ns = 0  # monotonic_ns of the last fused fix (freshness)
+        # -- Phase-4B: worker-owned structured target + gate-relative guidance (log-only) --
+        self._policy = gr.default_policy()  # evaluated HERE, never on the command loop
+        self._target = gr.empty_structured_target()  # most recent selected structured target
+        self._next_target = gr.empty_structured_target()  # provisional next race gate
+        self._target_pub = self._target  # atomic published structured-target snapshot
+        self._next_target_pub = self._next_target
+        self._decision_pub = gr.idle_decision()  # atomic published guidance decision
+        self._sel_track_id: int | None = None  # continuity: last selected track id
+        self._sel_hits = 0  # consecutive frames the same track was selected
+        self._transition_start_ns = 0  # monotonic_ns when active_gate advanced past anchor
+        self._state_sequence = 0
+        self._target_sequence = 0
+        self._next_target_sequence = 0
+        self._decision_sequence = 0
         self._thread = threading.Thread(target=self._run, daemon=True, name="shadow-worker")
         # health / counters
         self.imu_predicts = 0
@@ -82,6 +144,7 @@ class ShadowWorker:
         self.reanchors = 0
         self.rejects = 0  # confirmed target that was bearing-only/degenerate → not fused
         self.assoc_refused = 0  # metric pose out of the gate's slant band / wrong turn side
+        self.transition_direction_only = 0  # promoted next target kept but not metric-fused
         self.accepted = 0  # update_gate passed the NIS gate
         self.nis_rejected = 0  # update_gate failed the NIS gate
         self.nis: list[float] = []
@@ -108,6 +171,43 @@ class ShadowWorker:
         """Atomic copy of the shadow ESKF velocity (safe cross-thread read for diagnostics)."""
         with self._state_lock:
             return self._v_pub.copy()
+
+    def state_snapshot(self) -> ShadowState:
+        """Atomic immutable snapshot of the shadow ESKF (safe cross-thread read, log-only)."""
+        with self._state_lock:
+            return self._state_pub
+
+    def guidance_snapshot(self) -> gr.GuidanceDecision:
+        """Atomic immutable gate-relative guidance decision (safe cross-thread read).
+
+        Coherent with :meth:`state_snapshot` / :meth:`target_snapshot` — all three are
+        republished together each tick under one lock, so a reader can never pair a fresh
+        state with an unrelated old target. Log-only; the command loop only records it."""
+        with self._state_lock:
+            return self._decision_pub
+
+    def target_snapshot(self) -> gr.StructuredTarget:
+        """Atomic immutable snapshot of the worker's selected structured target (log-only)."""
+        with self._state_lock:
+            return self._target_pub
+
+    def next_target_snapshot(self) -> gr.StructuredTarget:
+        """Atomic provisional next-gate snapshot (never fused before promotion)."""
+        with self._state_lock:
+            return self._next_target_pub
+
+    def coherent_snapshot(self) -> CoherentShadowSnapshot:
+        """Estimator state + structured target + guidance decision from the SAME tick.
+
+        Read together under one lock so the command loop cannot pair a fresh state with an
+        unrelated older target/decision. Log-only."""
+        with self._state_lock:
+            return CoherentShadowSnapshot(
+                self._state_pub,
+                self._target_pub,
+                self._next_target_pub,
+                self._decision_pub,
+            )
 
     def _assoc(self, active_gate: int) -> tuple[float | None, tuple[float, float] | None]:
         """Course-association constraints for the active gate: (turn sign, slant band)."""
@@ -155,6 +255,7 @@ class ShadowWorker:
             frames = list(self.sh.frame_q)
             self.sh.frame_q.clear()
             live = self.sh.is_live()
+            active_gate_now = self.sh.active_gate
         if imu:
             self.imu_hwm = max(self.imu_hwm, len(imu))
         # merged event stream by arrival_ns (kind 0=imu sorts before 1=frame at a tie)
@@ -169,8 +270,74 @@ class ShadowWorker:
                 self._predict_sample(payload, live)
             else:
                 self._process_frame(payload)
+        pd = self.kf.P.diagonal()
+        published_ns = time.monotonic_ns()
+        self._state_sequence += 1
+        snap = ShadowState(
+            anchor_gate=self._kf_active_gate,
+            initialised=self.kf.initialised,
+            last_fix_mono_ns=self._last_fix_mono_ns,
+            p=(float(self.kf.p[0]), float(self.kf.p[1]), float(self.kf.p[2])),
+            v=(float(self.kf.v[0]), float(self.kf.v[1]), float(self.kf.v[2])),
+            euler=tuple(float(x) for x in self.kf.euler),  # type: ignore[arg-type]
+            cov_diag=tuple(float(x) for x in pd[:9]),
+            sequence=self._state_sequence,
+            published_mono_ns=published_ns,
+        )
+        decision = self._decide(active_gate_now, pd, snap)
         with self._state_lock:
             self._v_pub = self.kf.v.copy()
+            self._state_pub = snap
+            self._target_pub = self._target
+            self._next_target_pub = self._next_target
+            self._decision_pub = decision
+
+    def _decide(
+        self, active_gate: int, pd: np.ndarray, state: ShadowState | None = None
+    ) -> gr.GuidanceDecision:
+        """Evaluate the gate-relative policy on the COHERENT (state, target) pair (log-only).
+
+        Runs ENTIRELY on the worker thread — the command loop performs no guidance. The
+        transition timer measures time since the race gate advanced past the ESKF anchor.
+        """
+        now_ns = time.monotonic_ns()
+        anchor = self._kf_active_gate
+        if anchor >= 0 and active_gate == anchor + 1:
+            if self._transition_start_ns == 0:
+                self._transition_start_ns = now_ns
+            transition_age_s = (now_ns - self._transition_start_ns) * 1e-9
+        else:
+            self._transition_start_ns = 0
+            transition_age_s = 0.0
+        fix_age_s = (now_ns - self._last_fix_mono_ns) * 1e-9 if self._last_fix_mono_ns else 1e9
+        decision = self._policy.step(
+            now_ns=now_ns,
+            active_gate=active_gate,
+            anchor_gate=anchor,
+            initialised=self.kf.initialised,
+            position_drone_rel_gate_ned_m=self.kf.p,
+            velocity_ned_mps=self.kf.v,
+            euler_rpy_rad=np.array(self.kf.euler),
+            cov_diag=np.asarray(pd[:9], float),
+            fix_age_s=fix_age_s,
+            target=self._target,
+            transition_age_s=transition_age_s,
+        )
+        self._decision_sequence += 1
+        state_sequence = self._state_sequence if state is None else state.sequence
+        state_mono_ns = now_ns if state is None else state.published_mono_ns
+        return dataclasses.replace(
+            decision,
+            decision_mono_ns=time.monotonic_ns(),
+            decision_sequence=self._decision_sequence,
+            state_sequence=state_sequence,
+            state_mono_ns=state_mono_ns,
+            target_sequence=self._target.sequence,
+            input_mono_ns=now_ns,
+            initialised=self.kf.initialised,
+            fix_age_s=fix_age_s,
+            transition_age_s=transition_age_s,
+        )
 
     def _predict_sample(self, sample: tuple, live: bool) -> None:
         su, arr, ax, ay, az, gx, gy, gz = sample
@@ -181,7 +348,9 @@ class ShadowWorker:
         if self._imu_prev_us is not None:
             d = (su - self._imu_prev_us) * 1e-6
             if 0.0 < d < IMU_MAX_DT:
-                self.kf.predict(acc, gyro, d)
+                # sim gyro is sign-inverted vs our FRD body frame (see recorder.GYRO_SIGN);
+                # correct only at ESKF intake, matching replay_arrival_order exactly.
+                self.kf.predict(acc, gyro * recmod.GYRO_SIGN, d)
                 self.imu_predicts += 1
                 if not live:  # gravity aiding only pre-launch (ground), like the AttEstimator
                     self.kf.update_gravity(acc)
@@ -198,12 +367,14 @@ class ShadowWorker:
             obs.timestamp_ns = sensor_ns
             gates.solve_gate_pose(obs)
         turn_sign, band = self._assoc(active_gate)
-        sel = self.tracker.step(
+        tracked = self.tracker.step_result(
             cands,
             active_gate_index=active_gate,
             expected_turn_sign=turn_sign,
             range_band=band,
+            next_turn_sign=GATE1_TURN_SIGN if active_gate == 0 else None,
         )
+        sel = tracked.active
         self.proc_ms.append((time.perf_counter() - t0) * 1e3)
         self.frames_processed += 1
         self.candidates_total += len(cands)
@@ -223,12 +394,29 @@ class ShadowWorker:
                 self.rejects += 1  # bearing-only/degenerate/inconsistent never fuse
                 disposition = "bearing_only"
             elif not self._fusion_eligible(sel, active_gate):
-                # HARD metric guard on EVERY reanchor/update: out-of-band / wrong-side =
-                # wrong-gate lock (e.g. a 24-27 m gate-2 imposter for the 3-16 m gate 1).
-                # Refuse, retire to re-acquire; never relax NIS/covariance to accept it.
-                self.assoc_refused += 1
-                self.tracker.retire_active()
-                disposition = "assoc_refused"
+                assoc_turn, assoc_band = self._assoc(active_gate)
+                wrong_side = assoc_turn is not None and sel.bearing * assoc_turn <= 0.0
+                slant = sel.slant_range
+                out_of_band = (
+                    assoc_band is not None
+                    and slant is not None
+                    and not (assoc_band[0] <= slant <= assoc_band[1])
+                )
+                # A pre-pass-confirmed next gate may remain a DIRECTION reference while
+                # outside the metric fusion band. It is never fused until in-band. An
+                # ordinary far acquisition or anything on the wrong side is still retired.
+                if (
+                    tracked.active_from_provisional
+                    and active_gate == self._kf_active_gate + 1
+                    and out_of_band
+                    and not wrong_side
+                ):
+                    self.transition_direction_only += 1
+                    disposition = "transition_direction"
+                else:
+                    self.assoc_refused += 1
+                    self.tracker.retire_active()
+                    disposition = "assoc_refused"
             else:
                 gate_body = gates.CAM_TO_BODY @ np.array(sel.pose_cam)
                 cov_body = None if sel.pose_cov is None else gates.pose_cov_body(sel.pose_cov)
@@ -250,6 +438,7 @@ class ShadowWorker:
                     else:
                         self.nis_rejected += 1
                         disposition = "nis_rejected"
+                self._last_fix_mono_ns = arrival_ns  # freshness clock for the state snapshot
                 if self.recorder is not None:
                     self.recorder.add_fix(
                         sensor_ns,
@@ -261,9 +450,144 @@ class ShadowWorker:
                     )
                 self._check_health()
 
-        self._record_frame_diag(frame_ev, sel, disposition, nis)
+        self._update_structured_targets(frame_ev, tracked, disposition)
+        self._record_frame_diag(frame_ev, sel, tracked.next, disposition, nis)
+        if self._frame_dir is not None:  # raw image AFTER the latency window (diagnostic)
+            trk = -1 if sel is None or sel.track_id is None else sel.track_id
+            name = f"f{frame_id:04d}_g{active_gate}_t{trk}_{disposition}.png"
+            cv2.imwrite(str(self._frame_dir / name), img)
 
-    def _record_frame_diag(self, frame_ev: tuple, sel, disposition: str, nis: float) -> None:
+    def _update_structured_targets(
+        self, frame_ev: tuple, tracked: gates.GateTrackerResult, disposition: str
+    ) -> None:
+        """Build the immutable structured-target snapshot from the SELECTED tracker obs.
+
+        The confirmed structured pipeline (never legacy ``gates.detect``). LOS is the
+        metric-pose DIRECTION when posed (scale untrusted), else the horizontal bearing.
+        Continuity = consecutive frames selecting the same track id."""
+        frame_id, sensor_ns, arrival_ns, _wall_ns, active_gate, _img = frame_ev
+        sel = tracked.active
+        turn_sign, band = self._assoc(active_gate)
+        tid = None if sel is None or sel.track_id is None else int(sel.track_id)
+        if tid is not None and tid == self._sel_track_id:
+            self._sel_hits += 1
+        else:
+            self._sel_track_id = tid
+            self._sel_hits = 1 if tid is not None else 0
+        self._target_sequence += 1
+        if sel is None:
+            self._target = dataclasses.replace(
+                gr.empty_structured_target(arrival_ns), sequence=self._target_sequence
+            )
+        else:
+            # The tracker owns visual continuity. In particular, promotion of a
+            # pre-pass provisional must preserve its already-confirmed streak instead
+            # of resetting policy confidence to one merely because it became active.
+            # Test doubles/legacy observations may not publish a streak, so retain the
+            # worker-local fallback for those callers.
+            selected_hits = sel.track_streak if sel.track_streak > 0 else self._sel_hits
+            self._target = self._structured_from_observation(
+                sel,
+                frame_id=frame_id,
+                sensor_ns=sensor_ns,
+                arrival_ns=arrival_ns,
+                active_gate=active_gate,
+                race_gate=active_gate,
+                hits=selected_hits,
+                turn_sign=turn_sign,
+                band=band,
+                disposition=disposition,
+                sequence=self._target_sequence,
+            )
+
+        self._next_target_sequence += 1
+        nxt = tracked.next
+        if nxt is None:
+            self._next_target = dataclasses.replace(
+                gr.empty_structured_target(arrival_ns), sequence=self._next_target_sequence
+            )
+        else:
+            self._next_target = self._structured_from_observation(
+                nxt,
+                frame_id=frame_id,
+                sensor_ns=sensor_ns,
+                arrival_ns=arrival_ns,
+                active_gate=active_gate,
+                race_gate=active_gate + 1,
+                hits=max(1, nxt.track_streak),
+                turn_sign=GATE1_TURN_SIGN,
+                band=None,
+                disposition="provisional",
+                sequence=self._next_target_sequence,
+            )
+
+    @staticmethod
+    def _structured_from_observation(
+        sel: gates.GateObservation,
+        *,
+        frame_id: int,
+        sensor_ns: int,
+        arrival_ns: int,
+        active_gate: int,
+        race_gate: int,
+        hits: int,
+        turn_sign: float | None,
+        band: tuple[float, float] | None,
+        disposition: str,
+        sequence: int,
+    ) -> gr.StructuredTarget:
+        """Freeze one fresh tracker observation for cross-thread publication."""
+        has_metric = sel.pose_cam is not None and sel.output_mode in (
+            gates.OutputMode.FULL_POSE,
+            gates.OutputMode.POSITION_ONLY,
+        )
+        if has_metric:
+            gate_body = gates.CAM_TO_BODY @ np.array(sel.pose_cam)
+            n = float(np.linalg.norm(gate_body))
+            los = gate_body / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+        else:  # horizontal LOS from the image bearing (elevation unknown without a pose)
+            b = float(sel.bearing)
+            los = np.array([np.cos(b), np.sin(b), 0.0])
+        slant = sel.slant_range
+        wrong_side = turn_sign is not None and sel.bearing * turn_sign <= 0.0
+        oob = band is not None and slant is not None and not (band[0] <= slant <= band[1])
+        vroll = sel.vision_roll
+        bx, by, bw, bh = sel.bbox
+        return gr.StructuredTarget(
+            valid=True,
+            frame_id=frame_id,
+            frame_sensor_ns=sensor_ns,
+            arrival_ns=arrival_ns,
+            active_gate_at_receipt=active_gate,
+            track_id=-1 if sel.track_id is None else int(sel.track_id),
+            race_gate_id=race_gate,
+            track_hits=hits,
+            output_mode=sel.output_mode.value,
+            bearing_rad=float(sel.bearing),
+            los_body_unit=los,
+            slant_range_m=float("nan") if slant is None else float(slant),
+            has_metric_pose=has_metric,
+            confidence=float(sel.confidence),
+            cov_trace=float("nan") if sel.pose_cov is None else float(np.trace(sel.pose_cov)),
+            expected_turn_sign=0.0 if turn_sign is None else float(turn_sign),
+            disposition=disposition,
+            # out-of-band alone is NOT an identity refusal (right gate, right side, too far
+            # to FUSE) — only a wrong-side lock is a genuine association refusal.
+            association_refused=bool(disposition == "assoc_refused" and wrong_side),
+            wrong_turn=bool(wrong_side),
+            out_of_band=bool(oob),
+            sequence=sequence,
+            cx_px=float(sel.cx),
+            cy_px=float(sel.cy),
+            area_px2=float(sel.area),
+            bbox_xywh=(int(bx), int(by), int(bw), int(bh)),
+            visible_fraction=float(sel.visible_fraction),
+            vision_roll_rad=float("nan") if vroll is None else float(vroll),
+        )
+
+    def _record_frame_diag(
+        self, frame_ev: tuple, sel, next_sel, disposition: str, nis: float
+    ) -> None:
         """Per-frame diagnostic row (EVERY frame, fused or not) — lets the next run
         explain each observation: latency, target identity, PnP geometry, disposition,
         and shadow-vs-active attitude."""
@@ -277,6 +601,8 @@ class ShadowWorker:
         cov_tr = (
             float("nan") if sel is None or sel.pose_cov is None else float(np.trace(sel.pose_cov))
         )
+        pnp_roll_value = None if sel is None else sel.vision_roll
+        pnp_roll = float("nan") if pnp_roll_value is None else pnp_roll_value
         self.recorder.add_frame(
             frame_id=frame_id,
             cam_ns=sensor_ns,
@@ -300,6 +626,17 @@ class ShadowWorker:
             nis=nis,
             shadow_att=(float(sr), float(sp), float(sy)),
             active_att=(float(active_att[0]), float(active_att[1]), float(active_att[2])),
+            pnp_roll=pnp_roll,
+            up_body=(float("nan"),) * 3 if sel is None or sel.up_body is None else sel.up_body,
+            next_track=-1 if next_sel is None or next_sel.track_id is None else next_sel.track_id,
+            next_streak=0 if next_sel is None else next_sel.track_streak,
+            next_misses=0 if next_sel is None else next_sel.track_misses,
+            next_bearing=float("nan") if next_sel is None else next_sel.bearing,
+            next_slant=float("nan")
+            if next_sel is None or next_sel.slant_range is None
+            else next_sel.slant_range,
+            next_conf=float("nan") if next_sel is None else next_sel.confidence,
+            next_mode="none" if next_sel is None else next_sel.output_mode.value,
         )
 
     def _check_health(self) -> None:
@@ -327,6 +664,7 @@ class ShadowWorker:
             f"reanchor={self.reanchors} fixes={self.fixes} acc={self.accepted} "
             f"nis_rej={self.nis_rejected} bearing_rej={self.rejects} "
             f"assoc_refused={self.assoc_refused} "
+            f"transition_dir={self.transition_direction_only} "
             f"nis[med={np.median(nis):.1f} p95={np.quantile(nis, 0.95):.1f} max={nis.max():.1f}] "
             f"perc_ms[mean={pm.mean():.1f} p95={np.quantile(pm, 0.95):.1f} max={pm.max():.1f}] "
             f"imu[predicts={self.imu_predicts} dt_rej={self.imu_dt_rejects} hwm={self.imu_hwm} "

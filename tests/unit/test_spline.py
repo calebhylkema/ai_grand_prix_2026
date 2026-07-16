@@ -19,7 +19,11 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
-from drone_racing.planning.spline import RacingLine, build_racing_line
+from drone_racing.planning.spline import (
+    RacingLine,
+    build_racing_line,
+    evaluate_gate_passages,
+)
 from drone_racing.utils.config import load_config
 from drone_racing.utils.transforms import quat_identity
 
@@ -39,9 +43,12 @@ def planner_config() -> PlannerConfig:
 
 def _straight_gates(n: int = 5, spacing: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
     """Gates evenly spaced along the X axis, facing +X."""
+    from scipy.spatial.transform import Rotation
+
     positions = np.zeros((n, 3))
     positions[:, 0] = np.arange(n) * spacing
-    orientations = np.tile(quat_identity(), (n, 1))
+    # Gate traversal normal is local +Z; rotate it onto world +X.
+    orientations = np.tile(Rotation.from_euler("y", np.pi / 2).as_quat(), (n, 1))
     return positions, orientations
 
 
@@ -159,6 +166,49 @@ class TestRacingLineProperties:
         line = build_racing_line(pos, ori, planner_config, closed=False)
         assert np.all(line.curvatures >= 0.0)
 
+    def test_reference_acceleration_is_velocity_time_derivative(
+        self, planner_config: PlannerConfig
+    ) -> None:
+        pos, ori = _circular_gates(n=8, radius=15.0)
+        line = build_racing_line(pos, ori, planner_config, num_points=500, closed=True)
+        velocity = line.tangents * line.speeds[:, np.newaxis]
+        derivative = np.gradient(velocity, line.arc_lengths, axis=0, edge_order=2)
+        expected = line.speeds[:, np.newaxis] * derivative
+        assert line.accelerations is not None
+        assert_allclose(line.accelerations, expected, atol=1e-10)
+
+    def test_kinematics_query_returns_finite_feedforward(
+        self, planner_config: PlannerConfig
+    ) -> None:
+        pos, ori = _circular_gates()
+        line = build_racing_line(pos, ori, planner_config, num_points=300, closed=True)
+        position, tangent, speed, acceleration, curvature = line.kinematics_at_progress(0.43)
+        assert position.shape == tangent.shape == acceleration.shape == (3,)
+        assert np.linalg.norm(tangent) == pytest.approx(1.0)
+        assert speed > 0.0
+        assert curvature >= 0.0
+        assert np.all(np.isfinite(acceleration))
+
+    def test_samples_are_uniform_in_physical_arc_length(
+        self, planner_config: PlannerConfig
+    ) -> None:
+        pos, ori = _circular_gates()
+        line = build_racing_line(pos, ori, planner_config, num_points=300, closed=True)
+        distances = np.diff(line.arc_lengths)
+        assert np.std(distances) / np.mean(distances) < 0.01
+
+    def test_speed_profile_respects_acceleration_limits(
+        self, planner_config: PlannerConfig
+    ) -> None:
+        pos, ori = _circular_gates(n=8, radius=10.0)
+        line = build_racing_line(pos, ori, planner_config, num_points=300, closed=True)
+        distance = np.diff(line.arc_lengths)
+        delta_v2 = np.diff(line.speeds**2)
+        assert np.all(
+            delta_v2 <= 2.0 * planner_config.max_longitudinal_accel_mps2 * distance + 1e-6
+        )
+        assert np.all(-delta_v2 <= 2.0 * planner_config.max_braking_accel_mps2 * distance + 1e-6)
+
 
 # ---------------------------------------------------------------------------
 # Progress queries
@@ -202,6 +252,65 @@ class TestProgressQueries:
         mid_pos = line.positions[len(line.positions) // 2]
         s = line.closest_progress(mid_pos)
         assert 0.3 < s < 0.7
+
+    def test_local_progress_cannot_jump_backward(self, planner_config: PlannerConfig) -> None:
+        pos, ori = _straight_gates()
+        line = build_racing_line(pos, ori, planner_config, closed=False)
+        progress = line.closest_progress(
+            line.positions[10],
+            previous_progress=0.7,
+            search_window=0.1,
+            max_backtrack=0.0,
+        )
+        assert progress >= 0.7
+
+
+class TestGatePassage:
+    """A reference must cross ordered gate apertures in the valid direction."""
+
+    def test_explicit_normals_cross_centers_with_clearance(
+        self, planner_config: PlannerConfig
+    ) -> None:
+        positions = np.array([[0.0, 0.0, 0.0], [9.2, 6.4, -0.6]])
+        normals = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        orientations = np.tile(quat_identity(), (2, 1))
+        line = build_racing_line(
+            positions,
+            orientations,
+            planner_config,
+            num_points=400,
+            closed=False,
+            gate_normals=normals,
+        )
+        reports = evaluate_gate_passages(
+            line,
+            positions,
+            normals,
+            np.full((2, 2), 1.5),
+            vehicle_radius_m=0.14,
+            tracking_margin_m=0.2,
+        )
+        assert all(report.passed for report in reports)
+        assert all(report.clearance_m > 0.4 for report in reports)
+
+    def test_uncertainty_can_make_a_gate_infeasible(self, planner_config: PlannerConfig) -> None:
+        positions = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+        normals = np.tile(np.array([1.0, 0.0, 0.0]), (2, 1))
+        orientations = np.tile(quat_identity(), (2, 1))
+        line = build_racing_line(
+            positions, orientations, planner_config, closed=False, gate_normals=normals
+        )
+        reports = evaluate_gate_passages(
+            line,
+            positions,
+            normals,
+            np.full((2, 2), 1.5),
+            vehicle_radius_m=0.14,
+            tracking_margin_m=0.2,
+            position_std_m=np.full((2, 3), 0.2),
+        )
+        assert all(not report.passed for report in reports)
+        assert all(report.clearance_m < 0.0 for report in reports)
 
 
 # ---------------------------------------------------------------------------

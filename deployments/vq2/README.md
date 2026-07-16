@@ -23,8 +23,17 @@ course_maps/           small, reviewed course maps mined from traces
   (`drone_racing.deployments.vq2.config.load`).
 - Numerical flight values (gains, clamps, thresholds) are flight-validated;
   treat edits like control-code edits (see `docs/reference/safety.md`).
+- `permit_transition_authority` is only one half of a two-factor Training experiment
+  gate; the CLI must also explicitly request `--experimental-transition-authority`.
+  Qualification sets the permission false and rejects the flag. The first bounded
+  experiment did not pass its target-continuity acceptance gate, so do not enable it
+  again until `docs/project/status.md` records a new review.
 - Course maps here are the reviewed, version-controlled artifacts. Raw map
   observations and trace archives belong in `.local/datasets/vq2/` (gitignored).
+- A checked-in artifact is not automatically flight-ready. Load through
+  `course_map.load_course_map`; command-authority callers must request
+  `require_flight_ready=True`. `vq2_historical_v0.toml` documents legacy evidence
+  and is intentionally rejected for flight.
 
 ## How configs are found
 

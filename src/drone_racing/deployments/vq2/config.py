@@ -56,7 +56,7 @@ class MissionParams:
     # THREAD: servo onto the acquired gate
     kp_roll_bear: float
     recenter_pitch: float
-    accept_z: tuple[float, float]
+    accept_depth_m: tuple[float, float]
     accept_turn: tuple[float, float]  # radians (TOML stores degrees)
     target_hold_s: float
     lost_brake_s: float
@@ -73,6 +73,8 @@ class RunParams:
     attempts: int
     trace: bool
     mavlink_endpoint: str
+    permit_transition_authority: bool
+    permit_visual_handoff: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +114,7 @@ def load(name_or_path: str | Path) -> VQ2Config:
     m = dict(raw["mission"])
     turn_deg = m.pop("accept_turn_deg")
     m["accept_turn"] = (math.radians(turn_deg[0]), math.radians(turn_deg[1]))
-    m["accept_z"] = tuple(m["accept_z"])
+    m["accept_depth_m"] = tuple(m["accept_depth_m"])
     mission = MissionParams(**m)
     run = RunParams(**raw["run"])
     return VQ2Config(name=raw.get("name", path.stem), mission=mission, run=run)

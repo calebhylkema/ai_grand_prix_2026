@@ -57,6 +57,7 @@ class FallbackReason:
     MPCC_FAIL = "mpcc_fail"
     STATE_UNRELIABLE = "state_unreliable"
     EMERGENCY_TILT = "emergency_tilt"
+    SHADOW_ONLY = "shadow_only"
 
 
 @dataclass(slots=True)
@@ -94,12 +95,15 @@ class MPCCController:
         control_config: ControlConfig,
         attitude_tau: float = 0.2,
         replan_dt_ns: int | None = None,
+        *,
+        allow_command_authority: bool = False,
     ) -> None:
         self._mpcc = mpcc_solver
         self._racing_line = racing_line
         self._pid = pid_controller
         self._cfg = control_config
         self._tau = attitude_tau
+        self._allow_command_authority = allow_command_authority
         self._current_progress: float = 0.0
         self._last_stats: MPCCControllerStats | None = None
         self._consecutive_failures: int = 0
@@ -193,6 +197,19 @@ class MPCCController:
             )
             return cmd
 
+        # The reusable MPCC stack is pre-sim lineage and is shadow-only by default.
+        # A caller must make command authority explicit; the active VQ2 deployment
+        # never instantiates this adapter.
+        if not self._allow_command_authority:
+            cmd = self._pid_fallback(state)
+            self._last_stats = MPCCControllerStats(
+                fallback_reason=FallbackReason.SHADOW_ONLY,
+                solve_time_ms=0.0,
+                progress=self._current_progress,
+                mpcc_success=False,
+            )
+            return cmd
+
         # --- Check if we need to re-plan ---
         needs_replan = (
             self._last_solution is None
@@ -202,14 +219,22 @@ class MPCCController:
 
         if needs_replan:
             # Update progress from position
-            pos_progress = self._racing_line.closest_progress(state.position)
-            dp = pos_progress - self._current_progress
-            if dp < -0.5:
-                dp += 1.0
-            if dp > 0.5:
-                dp -= 1.0
-            if abs(dp) < 0.1:
-                self._current_progress = pos_progress
+            if self._racing_line.closed:
+                pos_progress = self._racing_line.closest_progress(state.position)
+                dp = pos_progress - self._current_progress
+                if dp < -0.5:
+                    dp += 1.0
+                if dp > 0.5:
+                    dp -= 1.0
+                if abs(dp) < 0.1:
+                    self._current_progress = pos_progress
+            else:
+                self._current_progress = self._racing_line.closest_progress(
+                    state.position,
+                    previous_progress=self._current_progress,
+                    search_window=0.1,
+                    max_backtrack=0.0,
+                )
 
             mpcc_state = _state_to_mpcc(state)
             sol = self._mpcc.solve(mpcc_state, self._current_progress)
@@ -271,7 +296,8 @@ class MPCCController:
             PID-generated command.
         """
         # Look ahead on the racing line for a setpoint
-        lookahead = (self._current_progress + 0.015) % 1.0
+        lookahead = self._current_progress + 0.015
+        lookahead = lookahead % 1.0 if self._racing_line.closed else min(1.0, lookahead)
         target_pos, target_tangent, target_speed = self._racing_line.at_progress(lookahead)
 
         # Clamp setpoint distance
@@ -422,7 +448,7 @@ def _hover_command(state: State) -> DroneCommand:
     """
     return DroneCommand(
         timestamp_ns=state.timestamp_ns,
-        throttle=0.5,  # approximate hover
+        throttle=0.30,  # measured VQ2 hover; this helper remains fallback-only
         roll_rate=0.0,
         pitch_rate=0.0,
         yaw_rate=0.0,

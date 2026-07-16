@@ -311,6 +311,7 @@ class TestMPCCLatency:
             racing_line=racing_line,
             pid_controller=pid,
             control_config=config.control,
+            allow_command_authority=True,
         )
 
         # Build a state for the controller

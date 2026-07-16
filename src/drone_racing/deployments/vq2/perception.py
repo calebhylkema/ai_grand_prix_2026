@@ -337,6 +337,27 @@ def _order_quad(pts: np.ndarray) -> np.ndarray:
     )
 
 
+def _order_quad_robust(pts: np.ndarray) -> np.ndarray:
+    """Order any convex quad's corners tl,tr,br,bl (to match GATE_OBJ), robust to rotation.
+
+    The legacy ``_order_quad`` sum/diff heuristic (argmin(x+y) etc.) COLLAPSES for a
+    diamond-oriented (~45°-rotated) quad: the extreme point wins two categories, so two
+    corners map to the same vertex and one true corner is dropped — a zero-length side that
+    the PnP stage then rejects as ``degenerate``. Gate 1 is viewed rotated through the
+    banked turn, so this is its dominant metric-pose failure (see the 2026-07-13 gate-1
+    analysis). Sorting corners by angle about the centroid gives a consistent winding for
+    ANY orientation; starting at the top-left-most corner reproduces the legacy tl,tr,br,bl
+    order EXACTLY for axis-aligned quads (so the head-on gate 0 is unchanged). Used only by
+    the structured pipeline (``_quad_from_contour``); legacy ``detect()`` keeps the old
+    helper so the active control path is byte-for-byte unaffected.
+    """
+    p = np.asarray(pts, np.float64).reshape(-1, 2)
+    c = p.mean(axis=0)
+    p = p[np.argsort(np.arctan2(p[:, 1] - c[1], p[:, 0] - c[0]))]  # consistent CW winding
+    start = int(np.argmin(p.sum(axis=1)))  # begin at the top-left-most corner
+    return np.roll(p, -start, axis=0)
+
+
 def _pnp(
     quad: np.ndarray,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
@@ -520,6 +541,8 @@ class GateObservation:
     timestamp_ns: int | None = None
     track_id: int | None = None  # visual track identity (tracker-assigned)
     race_gate_id: int | None = None  # expected race-gate index (tracker-assigned)
+    track_streak: int = 0  # consecutive matched frames for this visual identity
+    track_misses: int = 0  # unmatched frames since the last fresh observation
 
     @property
     def range_cam(self) -> float | None:
@@ -535,13 +558,20 @@ class GateObservation:
         """
         return None if self.pose_cam is None else float(np.linalg.norm(self.pose_cam))
 
+    @property
+    def vision_roll(self) -> float | None:
+        """Absolute body roll from the upright gate; pitch remains planar-ambiguous."""
+        if self.up_body is None:
+            return None
+        return float(math.atan2(-self.up_body[1], -self.up_body[2]))
+
 
 def _quad_from_contour(c: np.ndarray) -> np.ndarray | None:
     """Ordered (4,2) tl,tr,br,bl quad if the contour fits a convex 4-gon, else None."""
     peri = cv2.arcLength(c, True)
     approx = cv2.approxPolyDP(c, 0.04 * peri, True)
     if len(approx) == 4 and cv2.isContourConvex(approx):
-        return _order_quad(approx.reshape(4, 2).astype(np.float64))
+        return _order_quad_robust(approx.reshape(4, 2).astype(np.float64))
     return None
 
 
@@ -651,17 +681,26 @@ def detect_candidates(img: np.ndarray) -> list[GateObservation]:
         outer_corners = _quad_from_contour(c) if visibility is Visibility.FULL else None
         if outer_corners is not None:
             outer_corners = _refine_corners(gray, outer_corners)
-        inner_corners = (
-            _quad_from_contour(inner_contour)
-            if inner_contour is not None and visibility is Visibility.FULL
-            else None
-        )
+        # Inner opening: fit its corners when the HOLE ITSELF is fully in-frame — even if
+        # the OUTER frame is border-clipped. The inner 1.5 m opening is sharper (glow-
+        # immune) and, when whole, yields a metric pose from REAL corners without
+        # extrapolating the clipped outer side (2026-07-13 gate-1 analysis: 11/13
+        # border-clipped gate-1 views keep a full inner opening — the dominant remaining
+        # metric-pose gap after the corner-ordering fix). The inner/outer AREA-ratio guard
+        # is only meaningful when the outer is FULL (a clipped outer's area is truncated,
+        # so the ratio is invalid); the min-side + full-inner + ring guards still apply.
+        inner_corners = None
+        if inner_contour is not None:
+            ix, iy, iiw, iih = cv2.boundingRect(inner_contour)
+            if _visible_fraction((ix, iy, iiw, iih), w_img, h_img)[0] is Visibility.FULL:
+                inner_corners = _quad_from_contour(inner_contour)
         if inner_corners is not None and inner_contour is not None:
             iw2, ih2 = cv2.boundingRect(inner_contour)[2:]
             ratio = inner_area / area if area > 0 else 0.0
-            if min(iw2, ih2) < _MIN_INNER_SIDE_PX or not (
+            ratio_ok = visibility is not Visibility.FULL or (
                 _INNER_OUTER_AREA_RANGE[0] <= ratio <= _INNER_OUTER_AREA_RANGE[1]
-            ):
+            )
+            if min(iw2, ih2) < _MIN_INNER_SIDE_PX or not ratio_ok:
                 inner_corners = None  # collapsed/implausible opening (e.g. a glare artifact)
             else:
                 inner_corners = _refine_corners(gray, inner_corners)
@@ -706,6 +745,15 @@ _PASSED_WINDOW_FRAMES = 30  # exclude the passed gate's image region for this ma
 _PASSED_EXCL_PX = 80.0  # radius (px) around a passed gate's last position to exclude
 _JUMP_CENTROID_PX = 260.0  # impossible per-frame image jump
 _JUMP_SCALE_RATIO = 2.5  # impossible per-frame apparent-size ratio
+# Identity-continuity guard: a track that has posed CLOSE (a confirmed near gate) cannot
+# rebind to a candidate whose metric range/bearing jumps physically impossibly in one frame
+# (observed defect: gate-0 track id 1, posed at ~5 m/1°, absorbing a downstream ~21 m/+38°
+# gate that is really gate 1). This never fires on a bearing-only near gate (it has no range
+# to disqualify), so a close gate legitimately going clipped/bearing-only is retained.
+_CLOSE_METRIC_M = 8.0  # a track that posed at/under this is "close"
+_FAR_JUMP_M = 15.0  # a metric candidate beyond this, on a close track, is a different gate
+_BEARING_JUMP_RAD = math.radians(30.0)  # a near-centered close track cannot jump to this bearing
+_CENTERED_RAD = math.radians(12.0)  # "near-centered" reference for the bearing-jump guard
 
 
 @dataclass
@@ -720,10 +768,13 @@ class GateTrack:
     vx: float = 0.0
     vy: float = 0.0
     hits: int = 1
+    streak: int = 1
     misses: int = 0
     age: int = 0
     race_gate_id: int | None = None
     last_obs: GateObservation | None = None
+    min_range: float | None = None  # closest metric slant range this track has ever posed at
+    last_range: float | None = None  # most recent metric slant range (None if bearing-only)
 
     def predict(self) -> tuple[float, float]:
         """Constant-velocity image-space prediction of the next centroid."""
@@ -735,9 +786,15 @@ class GateTrack:
         self.vy = 0.6 * self.vy + 0.4 * (obs.cy - self.cy)
         self.cx, self.cy, self.area, self.bearing = obs.cx, obs.cy, obs.area, obs.bearing
         self.hits += 1
+        self.streak += 1
         self.misses = 0
         self.age += 1
         self.last_obs = obs
+        self.last_range = obs.slant_range
+        if obs.slant_range is not None:
+            self.min_range = (
+                obs.slant_range if self.min_range is None else min(self.min_range, obs.slant_range)
+            )
 
 
 def _assoc_cost(track: GateTrack, obs: GateObservation) -> float:
@@ -754,6 +811,21 @@ def _assoc_cost(track: GateTrack, obs: GateObservation) -> float:
     return d_cost + s_cost + b_cost
 
 
+@dataclass(frozen=True, slots=True)
+class GateTrackerResult:
+    """Fresh observations selected from one tracker association pass.
+
+    ``active`` is the confirmed current race gate. ``next`` is a provisional,
+    direction-gated next-gate identity that is never fused before promotion.
+    Predicted-only tracks are retained internally but are never returned as fresh data.
+    """
+
+    active: GateObservation | None
+    next: GateObservation | None
+    promoted_track_id: int | None = None
+    active_from_provisional: bool = False
+
+
 class GateTracker:
     """Associates detections to persistent tracks and owns the active-gate identity.
 
@@ -768,12 +840,15 @@ class GateTracker:
         self._active_id: int | None = None
         self._pending_id: int | None = None
         self._pending_count = 0
+        self._provisional_id: int | None = None
+        self._active_from_provisional = False
         self._active_gate_index: int | None = None
         self._retired: set[int] = set()  # track ids of already-passed gates (never re-select)
         self._turn_sign: float | None = None  # expected bearing sign for the new target
         self._range_band: tuple[float, float] | None = None  # expected slant-range window (m)
         self._frame = 0  # frame counter for time-boxed exclusion zones
         self._passed_zones: list[tuple[float, float, int]] = []  # (cx, cy, expire_frame)
+        self.identity_jumps_rejected = 0  # matches refused by the identity-continuity guard
 
     @property
     def tracks(self) -> list[GateTrack]:
@@ -792,6 +867,7 @@ class GateTracker:
             if prev is not None:
                 self._passed_zones.append((prev.cx, prev.cy, self._frame + _PASSED_WINDOW_FRAMES))
         self._active_id = None
+        self._active_from_provisional = False
         self._pending_id = None
         self._pending_count = 0
 
@@ -844,14 +920,55 @@ class GateTracker:
             The observation bound to the active identity this frame, or None if the
             active gate is unmatched/lost (identity is retained internally).
         """
+        return self.step_result(
+            observations,
+            active_gate_index=active_gate_index,
+            expected_turn_sign=expected_turn_sign,
+            range_band=range_band,
+        ).active
+
+    def step_result(
+        self,
+        observations: list[GateObservation],
+        active_gate_index: int | None = None,
+        expected_turn_sign: float | None = None,
+        range_band: tuple[float, float] | None = None,
+        next_turn_sign: float | None = None,
+    ) -> GateTrackerResult:
+        """Advance once and return current plus provisional next-gate observations.
+
+        The provisional path shares the exact same association pass and tracks as the
+        active path. It is direction-only before promotion: no range band is applied and
+        it cannot become a fusion measurement while another race gate is active.
+        """
         self._turn_sign = expected_turn_sign
         self._range_band = range_band
         self._frame += 1
         self._passed_zones = [z for z in self._passed_zones if z[2] > self._frame]  # prune
-        # a race-gate advance retires the old active gate and forces re-acquisition
+        promoted: int | None = None
+        # A race-gate advance retires only the old active gate. A still-live provisional
+        # next identity is promoted without another three-frame acquisition delay.
         if active_gate_index is not None and active_gate_index != self._active_gate_index:
+            candidate = self._provisional_id
             self.retire_active()
             self._active_gate_index = active_gate_index
+            self._provisional_id = None
+            if candidate is not None:
+                track = next(
+                    (
+                        t
+                        for t in self._tracks
+                        if t.track_id == candidate
+                        and t.track_id not in self._retired
+                        and t.misses <= _MAX_MISSES
+                    ),
+                    None,
+                )
+                if track is not None:
+                    self._active_id = candidate
+                    self._active_from_provisional = True
+                    track.race_gate_id = active_gate_index
+                    promoted = candidate
 
         matches = self._associate(observations)
         matched_obs: set[int] = set()
@@ -859,12 +976,28 @@ class GateTracker:
             if t.track_id in matches:
                 oi = matches[t.track_id]
                 obs = observations[oi]
+                if self._identity_jump(t, obs):
+                    # A physically impossible range/bearing jump for a track that posed
+                    # close: refuse the match. The track goes unmatched (misses++, and the
+                    # match is dropped so _select_active cannot use it), and this observation
+                    # is left free to spawn its OWN track (a different, downstream gate — often
+                    # the real gate-1 provisional).
+                    obs.reject_reason = "active_identity_jump"
+                    self.identity_jumps_rejected += 1
+                    matches.pop(t.track_id, None)
+                    t.misses += 1
+                    t.streak = 0
+                    t.age += 1
+                    continue
                 obs.track_id = t.track_id
                 obs.race_gate_id = t.race_gate_id
                 t.update(obs)
+                obs.track_streak = t.streak
+                obs.track_misses = 0
                 matched_obs.add(oi)
             else:
                 t.misses += 1
+                t.streak = 0
                 t.age += 1
         # spawn tracks for unmatched observations
         for oi, obs in enumerate(observations):
@@ -872,12 +1005,90 @@ class GateTracker:
                 continue
             t = GateTrack(self._next_id, obs.cx, obs.cy, obs.area, obs.bearing)
             obs.track_id = t.track_id
+            obs.track_streak = 1
+            obs.track_misses = 0
             self._tracks.append(t)
             self._next_id += 1
         # retire stale tracks
         self._tracks = [t for t in self._tracks if t.misses <= _MAX_MISSES]
 
-        return self._select_active(observations, matches)
+        active = self._select_active(observations, matches)
+        if (
+            promoted is not None
+            and active is not None
+            and expected_turn_sign is not None
+            and active.bearing * expected_turn_sign <= 0.0
+        ):
+            self.retire_active()
+            active = None
+            promoted = None
+        next_obs = self._select_provisional(observations, matches, next_turn_sign)
+        return GateTrackerResult(
+            active=active,
+            next=next_obs,
+            promoted_track_id=promoted,
+            active_from_provisional=self._active_from_provisional,
+        )
+
+    def _select_provisional(
+        self,
+        observations: list[GateObservation],
+        matches: dict[int, int],
+        turn_sign: float | None,
+    ) -> GateObservation | None:
+        """Return a fresh confirmed alternate without disturbing active selection."""
+        live = {t.track_id: t for t in self._tracks}
+        if turn_sign is None:
+            self._provisional_id = None
+            return None
+
+        if self._provisional_id is not None:
+            track = live.get(self._provisional_id)
+            if (
+                track is None
+                or track.track_id in self._retired
+                or track.track_id == self._active_id
+            ):
+                self._provisional_id = None
+            elif track.track_id in matches:
+                obs = observations[matches[track.track_id]]
+                if self._eligible_provisional(obs, turn_sign):
+                    return obs
+                self._provisional_id = None
+            else:
+                return None  # retain predicted identity, but never fabricate a fresh obs
+
+        candidates = [
+            (t, observations[matches[t.track_id]])
+            for t in self._tracks
+            if t.track_id in matches
+            and t.track_id != self._active_id
+            and t.track_id not in self._retired
+            and t.streak >= _SWITCH_CONFIRM
+            and self._eligible_provisional(observations[matches[t.track_id]], turn_sign)
+        ]
+        if not candidates:
+            return None
+        # Stable evidence first, then the nearest correct-side LOS, confidence, and id.
+        track, obs = min(
+            candidates,
+            key=lambda item: (
+                -item[0].streak,
+                abs(item[1].bearing),
+                -item[1].confidence,
+                item[0].track_id,
+            ),
+        )
+        self._provisional_id = track.track_id
+        return obs
+
+    def _eligible_provisional(self, obs: GateObservation, turn_sign: float) -> bool:
+        if obs.bearing * turn_sign <= 0.0:
+            return False
+        for zx, zy, _exp in self._passed_zones:
+            if math.hypot(obs.cx - zx, obs.cy - zy) < _PASSED_EXCL_PX:
+                return False
+        return True
 
     def _select_active(
         self, observations: list[GateObservation], matches: dict[int, int]
@@ -916,10 +1127,27 @@ class GateTracker:
             self._pending_id, self._pending_count = best_tid, 1
         if self._pending_count >= _SWITCH_CONFIRM:
             self._active_id = best_tid
+            self._active_from_provisional = False
             live[best_tid].race_gate_id = self._active_gate_index
             best_obs.race_gate_id = self._active_gate_index
             return best_obs
         return None
+
+    def _identity_jump(self, track: GateTrack, obs: GateObservation) -> bool:
+        """True if binding ``obs`` to ``track`` would be a physically impossible jump.
+
+        Only guards a track that has posed CLOSE (a confirmed near gate): such a track
+        cannot instantaneously rebind to a candidate whose metric slant range jumps far
+        (≈5 m → >15 m) or whose bearing jumps from near-centred to well off-axis. A
+        bearing-only candidate (no metric range) is never rejected here — a close gate
+        legitimately degrades to bearing-only as it clips at the plane."""
+        if track.min_range is None or track.min_range > _CLOSE_METRIC_M:
+            return False  # never posed close → ordinary far/new track, no identity to protect
+        rng = obs.slant_range
+        if rng is not None and rng > _FAR_JUMP_M:
+            return True  # a close gate cannot be a >15 m metric gate one frame later
+        # a near-centred close gate cannot jump to a large bearing
+        return bool(abs(track.bearing) < _CENTERED_RAD and abs(obs.bearing) > _BEARING_JUMP_RAD)
 
     def _eligible_new(self, obs: GateObservation) -> bool:
         """Whether a candidate may become the new active target under the expected

@@ -40,7 +40,7 @@ def test_flight_values_carried_over_verbatim() -> None:
     assert m.kp_yaw == 1.5
     assert m.brake_secs == 1.6
     assert m.brake_arrest_s == 1.0
-    assert m.accept_z == (3.0, 13.0)
+    assert m.accept_depth_m == (3.0, 13.0)
     assert m.pass_area == 15000.0
     assert m.pass_range_m == 3.5
 

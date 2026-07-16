@@ -83,6 +83,52 @@ def _set_pitch(fl: fly.Flight, pitch_rad: float) -> None:
     fl.att.q = np.array([math.cos(pitch_rad / 2), 0.0, math.sin(pitch_rad / 2), 0.0])
 
 
+def test_command_captures_boundary_telemetry_without_changing_output(monkeypatch) -> None:
+    """Phase-4A: command() records requested / post-clamp desired / calibrated levels and
+    per-axis saturation, and still SENDS exactly the clamped rates (behaviour unchanged)."""
+    sent: dict[str, float] = {}
+
+    def _fake_send(conn, ts, tc, lock, thr, rr, pr, yr) -> None:  # noqa: ANN001
+        sent.update(thr=thr, rr=rr, pr=pr, yr=yr)
+
+    monkeypatch.setattr(cc, "send_att", _fake_send)
+    fl = _flight()
+    fl.command(0.4, 9.9, 0.0, 5.0)  # roll far over MAX_RATE, yaw over MAX_YAW
+    assert fl.last_cmd is not None
+    assert fl.last_cmd["req"] == (0.4, 9.9, 0.0, 5.0)
+    # desired = clamped ACTUAL rates; the SAME values are what got sent
+    assert fl.last_cmd["des"][1] == fly.MAX_RATE and fl.last_cmd["des"][3] == fly.MAX_YAW
+    assert sent["rr"] == fly.MAX_RATE and sent["yr"] == fly.MAX_YAW and sent["thr"] == 0.4
+    # calibrated = desired / RATE_GAIN (applied ONCE, here)
+    assert abs(fl.last_cmd["cal"][1] - fly.MAX_RATE / cc.RATE_GAIN[0]) < 1e-9
+    assert fl.last_cmd["sat"] == (0.0, 1.0, 0.0, 1.0)  # roll+yaw clamped, pitch not
+
+
+def test_command_no_saturation_marks_clear(monkeypatch) -> None:
+    monkeypatch.setattr(cc, "send_att", lambda *a, **k: None)
+    fl = _flight()
+    fl.command(0.30, 0.5, -0.5, 0.5)  # all within limits
+    assert fl.last_cmd is not None and fl.last_cmd["sat"] == (0.0, 0.0, 0.0, 0.0)
+    assert fl.last_cmd["des"] == (0.30, 0.5, -0.5, 0.5)
+
+
+def test_command_output_is_shadow_independent(monkeypatch) -> None:
+    """Phase-4B strict shadow mode: guidance now lives ENTIRELY in ShadowWorker; the
+    command boundary has no reference to it, so command() output is deterministic and
+    cannot be perturbed by any shadow state. Flight has no ``shadow_policy`` attribute."""
+    sent: list[tuple[float, float, float, float]] = []
+    monkeypatch.setattr(
+        cc, "send_att", lambda c, ts, tc, lk, thr, rr, pr, yr: sent.append((thr, rr, pr, yr))
+    )
+    fl = _flight()
+    assert not hasattr(fl, "shadow_policy")  # guidance is not on the command path
+    fl.command(0.31, 0.4, -0.3, 0.2)
+    first_send, first_cmd = sent[-1], dict(fl.last_cmd)  # type: ignore[arg-type]
+    fl.command(0.31, 0.4, -0.3, 0.2)
+    assert sent[-1] == first_send  # deterministic sent rates
+    assert dict(fl.last_cmd) == first_cmd  # type: ignore[arg-type]  # identical boundary telemetry
+
+
 def test_tilt_comp_level_is_identity() -> None:
     """Level (cos=1) leaves an in-range thrust unchanged."""
     fl = _flight()

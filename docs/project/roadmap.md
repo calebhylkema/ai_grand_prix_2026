@@ -10,9 +10,15 @@ Environment: < 20 gates, 3D-scanned scenes, dynamic lighting, obstacles. Sensors
 HIGHRES_IMU + 640×360@30 Hz camera + RACE_STATUS + COLLISION only. Fastest valid
 time counts; objective = qualify for the Physical Qualifier.
 
-- [ ] Resolve the camera-tilt sign question (see status.md — do first)
-- [ ] Thread gate 1 (map-and-plan executor, ADR-0003)
-- [ ] Extend the course map to all legs; per-corner constants table
+- [x] Resolve camera tilt: 20° up, guarded by projection tests
+- [x] Add a typed map contract that rejects historical evidence for flight
+- [x] Add an open arc-length reference, aperture checks, and feasible speed profile
+- [x] Add a VQ2 NED rate/thrust dynamics and offline fitting contract
+- [ ] Collect corrected-pipeline evidence and promote a validated gate-0→1 map
+- [ ] Validate the ESKF sufficiently for conservative guidance authority
+- [ ] Shadow-evaluate the new reference on corrected recordings
+- [ ] Complete five consecutive gate-0→1 runs with conservative geometric guidance
+- [ ] Extend the validated course map to all legs
 - [ ] Full-course completion → bank a valid Qualification-mode time
 - [ ] Speed pass: trajectory through turns, higher cruise, command rate
 - [ ] Perception upgrade if clutter demands it (YOLOv8-pose on captured VQ2 frames)
@@ -25,14 +31,15 @@ Success criteria — minimum: qualify. Target: top 25% time. Stretch: top 10%.
 1. **Calibrated control** — done in principle (the 2.5× inverted gain was the wall).
 2. **Trajectory through turns:** arrive centered in position AND velocity
    (geometric guidance on ESKF state), not reactive point-and-servo.
-3. **Racing line:** B-spline through gate centers + curvature speed profile; then
-   MPCC (`drone_racing.planning.mpcc`, p95 22 ms warm-started) on the ESKF state.
+3. **Racing line:** open arc-length path through gate apertures with acceleration and
+   braking limits; shadow it before giving a conservative follower authority.
 4. **Command rate** 50 → ~100 Hz (spec cap < 100 Hz).
 5. **Cruise speed:** raise pitch/speed until threading degrades; brake-into-turn.
 6. **Perception latency:** classical CV ~5 ms; YOLO only if clutter demands it
    (ONNX, <17 ms). Never exceed ~40 ms end-to-end.
-7. **RL policy** (PPO, G&CNet-style) — only if classical+MPCC comfortably qualifies.
-   Reference: MonoRace won A2RL at 28 m/s with the same sensor suite.
+7. **MPCC, then RL:** only after conventional map following completes reliably.
+   Current MPCC timings are synthetic and existing RL data is not representative of
+   corrected VQ2 perception and dynamics.
 
 ## Phase 3 — Physical Qualifier (September 2026, Southern California)
 

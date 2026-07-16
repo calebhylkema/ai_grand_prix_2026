@@ -586,6 +586,11 @@ class TestMPCCSolver:
         state[:3] = pos
         prog = 0.0
 
+        # Seed the primal/dual warm start explicitly. A numerically converged cold solve may
+        # miss the strict 50 ms flight deadline on a throttled/shared CI host; it is rejected
+        # for authority but remains valid as a warm-start seed.
+        warmup = solver.solve(state, prog)
+        assert warmup.converged
         for step in range(20):
             sol = solver.solve(state, prog)
             assert sol.success, f"Failed at step {step}, progress={prog:.3f}"
@@ -607,6 +612,8 @@ class TestMPCCSolver:
         state[:3] = pos
         prog = 0.0
 
+        warmup = solver.solve(state, prog)
+        assert warmup.converged
         for step in range(500):
             sol = solver.solve(state, prog)
             assert sol.success, f"Failed at step {step}, progress={prog:.3f}"
@@ -616,3 +623,36 @@ class TestMPCCSolver:
                 break
 
         assert prog >= 1.0, f"Did not complete lap: progress={prog:.3f}"
+
+
+class TestMPCCSafetyContract:
+    """The reusable solver fails closed on deployment-unsafe assumptions."""
+
+    def test_open_course_is_the_default(self) -> None:
+        from drone_racing.planning.mpcc import MPCCSolver
+
+        line = _make_straight_racing_line(np.zeros(3), np.array([10.0, 0.0, 0.0]))
+        solver = MPCCSolver(line)
+        assert solver._closed is False
+
+    def test_solution_missed_deadline_is_rejected(self) -> None:
+        from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
+
+        line = _make_straight_racing_line(np.zeros(3), np.array([10.0, 0.0, 0.0]))
+        solver = MPCCSolver(line, MPCCConfig(horizon=5, max_solve_time_ms=0.0))
+        result = solver.solve(np.zeros(9), 0.0)
+        assert result.deadline_met is False
+        assert result.success is False
+        assert result.converged is True
+
+    def test_converged_deadline_miss_seeds_next_warm_start(self) -> None:
+        """Deadline rejection blocks authority without forcing every later solve cold."""
+        from drone_racing.planning.mpcc import MPCCConfig, MPCCSolver
+
+        line = _make_straight_racing_line(np.zeros(3), np.array([10.0, 0.0, 0.0]))
+        solver = MPCCSolver(line, MPCCConfig(horizon=5, max_solve_time_ms=0.0))
+        first = solver.solve(np.zeros(9), 0.0)
+        assert first.converged and not first.success
+        assert solver._prev_lam_g is not None and solver._prev_lam_x is not None
+        guess = solver._build_initial_guess(np.zeros(9), 0.0)
+        assert np.all(np.isfinite(guess))

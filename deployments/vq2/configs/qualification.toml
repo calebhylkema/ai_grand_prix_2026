@@ -30,7 +30,7 @@ scan_hold_pitch = 0.0     # LEVEL while turning (batch 7: nose-up drift fed the 
 # --- THREAD: servo onto the acquired gate ---
 kp_roll_bear = 0.30       # bank toward the gate — banking bends the VELOCITY vector
 recenter_pitch = 0.15     # close-but-off-centre brake (deep flare pushed the gate out of frame)
-accept_z = [3.0, 13.0]    # m — mapped gate-1 range band; second-leg imposters read 21-23 m
+accept_depth_m = [3.0, 13.0]  # camera-Z depth, NOT slant range; legacy association only
 accept_turn_deg = [25.0, 110.0]  # mapped corner window right of the exit heading
 target_hold_s = 0.8       # sighting persistence
 lost_brake_s = 0.8        # target stale mid-thread: brake level this long, then re-SCAN
@@ -43,3 +43,5 @@ secs = 45.0               # attempt duration cap (s)
 attempts = 1
 trace = false             # no trace I/O in the audited competitive stack
 mavlink_endpoint = "udpin:127.0.0.1:14550"
+permit_transition_authority = false  # qualification must never enable experimental guidance
+permit_visual_handoff = false  # qualification must never enable the experimental visual handoff

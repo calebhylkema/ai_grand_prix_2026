@@ -1,0 +1,51 @@
+# Historical map evidence from the 2026-07-09 trace miner.
+#
+# This file is intentionally NOT flight-ready. The three independent co-visible
+# pairs were produced by the pre-structured perception pipeline, and gate 1's
+# traversal normal was never measured. Offline tools may inspect it; flight code
+# must call load_course_map(..., require_flight_ready=True), which rejects it.
+
+schema_version = 1
+course_id = "vq2-historical-v0"
+status = "historical_unvalidated"
+frame = "gate0_local_ned"
+units = "si"
+drone_radius_m = 0.14
+tracking_margin_m = 0.20
+
+[[gates]]
+id = 0
+center_ned_m = [0.0, 0.0, 0.0]
+position_std_m = [0.0, 0.0, 0.0]
+inner_size_m = [1.5, 1.5]
+normal_ned = [1.0, 0.0, 0.0]
+
+[gates.evidence]
+perception_revision = "legacy-pre-structured-unknown-tilt"
+source_runs = []
+independent_runs = 0
+observation_count = 0
+
+[[gates]]
+id = 1
+# Robust center of the three old co-visible-pair deltas: forward, right, down.
+center_ned_m = [9.64, 6.52, -0.65]
+position_std_m = [0.95, 0.26, 0.22]
+inner_size_m = [1.5, 1.5]
+
+[gates.evidence]
+perception_revision = "legacy-pre-structured-unknown-tilt"
+source_runs = [
+  "prev_20260709_002545",
+  "prev_20260709_095943",
+  "prev_20260709_100003",
+]
+independent_runs = 3
+observation_count = 3
+
+[[legs]]
+from_gate = 0
+to_gate = 1
+expected_turn_sign = 1
+slant_range_m = [3.0, 16.0]
+turn_window_deg = [25.0, 110.0]
