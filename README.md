@@ -28,10 +28,6 @@ Camera Frame → Gate Detection → PnP Pose → ESKF Fusion → MPCC Planner �
 
 See `docs/PLAN.md` for the full development roadmap and `docs/RESEARCH.md` for technical research.
 
-## Claude Code
-
-This project is optimized for development with Claude Code. See `CLAUDE.md` for project context and `.claude/` for MCP configs, slash commands, and hooks.
-
 ## License
 
 MIT
